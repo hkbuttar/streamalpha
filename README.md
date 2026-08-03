@@ -1,8 +1,8 @@
 # StreamAlpha — Real-Time Market Anomaly Detection via Kafka
 
-Real-time market anomaly detection via Kafka. Online/streaming ML (incremental isolation forest, Bayesian changepoint detection) flags volume spikes and volatility regime shifts, built around an explicit exactly-once processing story. Extends [alpha-signal-lab](https://github.com/hkbuttar/alpha-signal-lab)'s equity universe with a true event-streaming architecture in place of that project's daily batch loop.
+Real-time market anomaly detection via Kafka. Online/streaming ML (a rolling z-score volume detector, from-scratch Bayesian changepoint detection) flags volume spikes and volatility regime shifts, built around an explicit exactly-once processing story. Extends [alpha-signal-lab](https://github.com/hkbuttar/alpha-signal-lab)'s equity universe with a true event-streaming architecture in place of that project's daily batch loop.
 
-> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), the idempotent Postgres sink, a cross-reference analysis against alpha-signal-lab's own factors, chaos testing (burst, kill, and disconnect tests against real infrastructure), and a read-only FastAPI backend are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is complete end to end and chaos-tested. A frontend dashboard and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
+> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), the idempotent Postgres sink, a cross-reference analysis against alpha-signal-lab's own factors, chaos testing (burst, kill, and disconnect tests against real infrastructure), a read-only FastAPI backend, and a React frontend dashboard are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is complete end to end and chaos-tested. Deployment is not yet built — see [Current Status](#current-status) for what's real versus what's planned.
 
 ---
 
@@ -15,10 +15,11 @@ Real-time market anomaly detection via Kafka. Online/streaming ML (incremental i
 6. [Cross-Reference Analysis](#cross-reference-analysis)
 7. [Chaos Testing](#chaos-testing)
 8. [Backend](#backend)
-9. [Repository Structure](#repository-structure)
-10. [Setup & Usage](#setup--usage)
-11. [Current Status](#current-status)
-12. [Future Work](#future-work)
+9. [Frontend](#frontend)
+10. [Repository Structure](#repository-structure)
+11. [Setup & Usage](#setup--usage)
+12. [Current Status](#current-status)
+13. [Future Work](#future-work)
 
 ---
 
@@ -46,7 +47,8 @@ flowchart LR
 
     S -->|read-only queries| B[FastAPI backend<br/>backend/main.py]
     T1 -->|live relay| B
-    B -.not yet built.-> F[Frontend dashboard]
+    B -->|REST + WebSocket| F[React dashboard<br/>frontend/]
+    F -.not yet built.-> D[Deployment]
 ```
 
 Solid boxes and arrows are built and verified; dashed ones are planned (see [Current Status](#current-status)). Every stage that exists is a separate module so ingestion, consumption, and (eventually) modeling can be tested and reasoned about independently.
@@ -191,6 +193,20 @@ The consumer is deliberately never stopped once started, even at zero subscriber
 
 ---
 
+## Frontend
+
+`frontend/` is a React + TypeScript + Vite single-page dashboard — the first non-Python code in this repo. Three panels, each independent so one slow or broken data source doesn't block the others:
+
+- **Live Ticks** — subscribes to `/ws/ticks` directly and prepends each relayed tick to a capped 50-row list. Reconnects with exponential backoff on drop (`frontend/src/hooks/useTickFeed.ts`), a small-scale echo of the same idea `ingestion/run.py` uses for the real Alpaca connection: a dropped feed should retry, not go silently stale.
+- **Detected Anomalies** — polls `GET /anomalies` every 5s.
+- **Pipeline Health** — polls `GET /status` every 5s (consumer lag, DLQ depth, tracked-ticker count).
+
+No build-time coupling to the backend beyond the response shapes hand-mirrored in `frontend/src/types.ts` — `VITE_API_BASE_URL` (see `frontend/.env.example`) points it at wherever `backend/main.py` is actually running, defaulting to `http://localhost:8000` to match that module's own Setup & Usage instructions.
+
+**Verified live in a real browser, not just "the build succeeded."** `tsc -b && vite build` passing proves the code compiles, not that it works — confirmed separately with Playwright against the actual running dev server and backend: connected two real browser contexts (light and dark `prefers-color-scheme`), watched `/ws/ticks`'s connection indicator turn green, produced a real Kafka message and confirmed it rendered in the Live Ticks panel within seconds, and confirmed the real 3-row anomalies table and real `/status` numbers rendered correctly in both color schemes — zero console errors, zero page errors, in either theme.
+
+---
+
 ## Repository Structure
 
 ```
@@ -200,6 +216,7 @@ streamalpha/
 ├── storage/                    # Idempotent Postgres sink: schema, upsert, manual-offset consumer
 ├── analysis/                   # Cross-reference detected anomalies against alpha-signal-lab's factors
 ├── backend/                    # read-only FastAPI layer: anomalies, status, live tick relay
+├── frontend/                   # React + TypeScript + Vite dashboard -- see Frontend
 ├── chaos/                      # burst, kill, and disconnect tests -- see Chaos Testing
 ├── notebooks/                  # research.ipynb: detector behavior + cross-reference, executed
 ├── tests/
@@ -255,6 +272,12 @@ uvicorn backend.main:app --reload
 curl http://127.0.0.1:8000/anomalies
 curl http://127.0.0.1:8000/status
 
+# frontend dashboard (separate terminal; requires the backend above running)
+cd frontend
+npm install
+npm run dev                            # http://localhost:5173
+cd ..
+
 # inspect or replay DLQ'd messages after fixing whatever caused them
 python -m streaming.dlq_tools inspect --limit 20
 python -m streaming.dlq_tools replay --limit 20
@@ -291,12 +314,13 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 - Chaos testing (`chaos/`) against real infrastructure: a burst test (8,000-message synthetic load, peak lag and recovery time measured), a kill test (`SIGKILL` deterministically landed in the exact commit-vs-durable-write race window, confirming no ticks lost and no duplicate rows despite confirmed real redelivery), and a disconnect test (real `pfctl` network block of Alpaca's host, confirming the connect-timeout watchdog and backoff/retry loop actually fire and reconnect). Also directly responsible for finding and fixing a real bug outside its own scope: Kafka's `log.dirs` was never pointed at the mounted `kafka-data` volume, so no topic had ever actually been durable across a container recreation. See [Chaos Testing](#chaos-testing) for real numbers and logs.
 - A read-only FastAPI backend (`backend/`) over anomalies, pipeline health, and a live tick relay, verified live end-to-end against real Kafka/Postgres — including a real concurrency bug found and fixed by testing its disconnect path specifically (an idle WebSocket client leaking its handler and Kafka consumer forever, hanging `uvicorn` on shutdown). See [Backend](#backend) for what broke and how it was confirmed fixed.
 - `notebooks/research.ipynb`, an executed (not template) notebook with real outputs: the real anomalies table as currently stored, a visualization of the volume detector's behavior on a synthetic isolated spike, a visualization of BOCPD's changepoint-probability dynamics on a synthetic volatility shift, and a live rerun of the cross-reference analysis.
+- A React + TypeScript + Vite frontend dashboard (`frontend/`), verified in a real browser (Playwright, not just a successful build) against the real running backend: live tick relay confirmed end-to-end by producing an actual Kafka message and watching it render, the real anomalies table and real `/status` numbers displayed correctly, both light and dark themes, zero console errors. See [Frontend](#frontend) for what was checked and how.
 
-**Not yet built:** the frontend dashboard and deployment.
+**Not yet built:** deployment.
 
 ---
 
 ## Future Work
 
 - Revisit the cross-reference analysis once weeks of real anomalies have accumulated — n=2 is a working pipeline, not a result; a real finding (or honestly, a real absence of one) needs a much larger sample.
-- A frontend dashboard, managed Kafka + hosting for deployment, and a full write-up of results, limitations, and assumptions once there's something real to report.
+- Managed Kafka + hosting for deployment, and a full write-up of results, limitations, and assumptions once there's something real to report.
