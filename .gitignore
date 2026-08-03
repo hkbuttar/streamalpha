@@ -8,3 +8,4 @@ venv/
 .ruff_cache/
 *.egg-info/
 .DS_Store
+model_state.pkl

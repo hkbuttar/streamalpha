@@ -2,7 +2,7 @@
 
 Real-time market anomaly detection via Kafka. Online/streaming ML (incremental isolation forest, Bayesian changepoint detection) flags volume spikes and volatility regime shifts, built around an explicit exactly-once processing story. Extends [alpha-signal-lab](https://github.com/hkbuttar/alpha-signal-lab)'s equity universe with a true event-streaming architecture in place of that project's daily batch loop.
 
-> **Status**: In progress. Ingestion and consumer correctness (manual offsets, DLQ routing and replay) are built and verified against a live Alpaca paper account and a local Kafka broker. Online ML, storage, backend, chaos testing, and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
+> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), and online anomaly detection (volume spikes, volatility regime changes) are built and verified against a live Alpaca paper account and a local Kafka broker. Storage, backend, chaos testing, and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
 
 ---
 
@@ -11,10 +11,11 @@ Real-time market anomaly detection via Kafka. Online/streaming ML (incremental i
 2. [System Architecture](#system-architecture)
 3. [Data](#data)
 4. [Correctness Design](#correctness-design)
-5. [Repository Structure](#repository-structure)
-6. [Setup & Usage](#setup--usage)
-7. [Current Status](#current-status)
-8. [Future Work](#future-work)
+5. [Online Anomaly Detection](#online-anomaly-detection)
+6. [Repository Structure](#repository-structure)
+7. [Setup & Usage](#setup--usage)
+8. [Current Status](#current-status)
+9. [Future Work](#future-work)
 
 ---
 
@@ -34,10 +35,10 @@ flowchart LR
     P -->|keyed by symbol| T1[(Kafka: market-ticks)]
     T1 --> C[Manual-offset consumer<br/>streaming/consumer.py]
     C -->|malformed payload| T2[(Kafka: market-ticks-dlq)]
-    C -->|valid tick| PT[process_tick<br/>currently: log + count]
+    C -->|valid tick| W[Per-ticker tumbling windows<br/>streaming/aggregation.py]
+    W --> M[Volume + regime models<br/>streaming/models.py]
+    M -->|idempotent producer| T3[(Kafka: volume-anomalies /<br/>regime-changes)]
 
-    PT -.not yet built.-> ML[Online ML<br/>isolation forest + changepoint detection]
-    ML -.not yet built.-> T3[(Kafka: volume-anomalies /<br/>regime-changes)]
     T3 -.not yet built.-> S[(Postgres sink)]
     S -.not yet built.-> B[FastAPI backend]
 ```
@@ -77,19 +78,43 @@ Exactly-once processing is treated as a deliberate design decision made of three
 
 ---
 
+## Online Anomaly Detection
+
+Two separate models per ticker, deliberately not one: a volume spike is a single window looking unlike its recent history, a volatility regime shift is a sustained change in the *distribution* of returns. Conflating them into one detector would blur two different failure modes into one signal.
+
+**Windowing (`streaming/aggregation.py`).** Trade ticks (not quotes — quotes are bid/ask book state, not a transaction) are aggregated into per-ticker tumbling windows, bounded by each trade's own timestamp rather than wall-clock arrival time, so replaying ticks later produces identical windows to processing them live. Each window closes with a trade volume total and a realized volatility figure (stdev of log returns within the window, `None` if fewer than 2 trades occurred).
+
+**Volume spikes: `river`'s `HalfSpaceTrees`** (its streaming analogue of an isolation forest), scored per window. Its raw anomaly score turned out not to be a usable absolute cutoff — a synthetic 50x spike scored 0.994 against a 0.963 baseline in testing, not a clean separation. `river.anomaly.QuantileFilter` looked like the fix (an adaptive quantile threshold) but its `q` parameter had zero measurable effect across a 10x range (0.99 to 0.999) here, traced to `river.stats.Quantile`'s online P²-style estimator appearing to have resolution problems at extreme quantiles with only a few hundred samples — not well understood, and not something to build on without understanding why. What's used instead is a threshold owned directly in `streaming/models.py`: flag a score more than `k` standard deviations above an exponentially-weighted rolling mean/variance of recent scores (`k=3.0`, `fading_factor=0.05`, both swept empirically against synthetic spikes before settling).
+
+**Volume detection: honest limitation, found by testing, not hidden.** An isolated single-window spike is detected unreliably: swept 10 random seeds against a 100x isolated spike with the shipped configuration and only 1-3/10 were detected. Tried reducing `HalfSpaceTrees`' tree height and feeding a volume-ratio feature instead of raw volume; neither meaningfully improved it. A sustained multi-window elevated-volume period showed the same weak recall (also 1/10). This is treated as a genuine characteristic of single-feature `HalfSpaceTrees` scoring on this kind of data — its scores compress toward a narrow high range for most points once the trees are built, regardless of magnitude — not a bug worth continuing to chase here. Richer features (recent volume trend, multiple lookback ratios) would likely help; that's future work. `tests/streaming/test_models.py` pins down what does and doesn't work with a fixed seed known to succeed, rather than asserting a reliability the model doesn't actually have.
+
+**Volatility regime shifts: Bayesian online changepoint detection (`streaming/changepoint.py`), implemented from scratch** — `river` has no BOCPD implementation; its `drift` module (ADWIN, KSWIN, PageHinkley) is a different family of technique. This is the Adams & MacKay (2007) algorithm: a probability distribution over "run length" (time since the last regime change), updated via Normal-Gamma conjugate statistics and a Student-t predictive density, all in log-space (linear-space predictive probabilities underflow quickly).
+
+Two real bugs surfaced while building and testing this against synthetic data with a known changepoint, not assumed correct from the derivation alone:
+- The obvious changepoint signal, `P(run length = 0)`, turned out to be **mathematically constant** — exactly the hazard rate, independent of the data. Confirmed both algebraically (it falls out of how the changepoint and growth branches share the same total-evidence normalizer) and empirically (it never moved off `1/hazard_lambda` for any input tried, including a 20-sigma outlier). The actual signal used instead is `P(run length <= k)` for small `k`, which does respond to data — probability mass concentrates on "this run just started" right after a real shift.
+- Realized volatility values are small in absolute terms (roughly 0.01–0.3 for short-window returns), while BOCPD's prior is implicitly scaled for data around magnitude 1. A clean 6x mean/variance shift in raw volatility went almost undetected (peak changepoint probability ~0.03) until the detector was fed `log(volatility)` instead, which is also the statistically conventional transform here regardless (volatility is positive and multiplicative, not a natural fit for a Normal model on its own) — detection went to ~0.96 on the same shift once fixed.
+
+Verified live end-to-end, not just in unit tests: a synthetic sustained volume/price shift fed through the full running consumer produced a real `RegimeChange` event (`changepoint_probability=0.99`) published to `regime-changes`, confirmed via `kafka-console-consumer`.
+
+**Model state persistence (`streaming/model_state.py`).** Each `TickerModels` instance (the `HalfSpaceTrees` pipeline and this project's own BOCPD state) is plain Python objects and pickles cleanly — confirmed by round-tripping trained state through `pickle.dumps`/`loads` before relying on it. State is saved periodically and on clean shutdown, written atomically (temp file + `os.replace`) so a crash mid-write can't corrupt the file for the next startup, and loaded back on startup — verified live: a second consumer run against the same state file logged `resumed model state for 1 ticker(s)` rather than starting cold.
+
+**At-least-once, not exactly-once, for anomaly events specifically.** If a tick produces two anomaly events and publishing the second one fails, the first may already be durably published before the exception propagates and crashes the consumer (per the design in [Correctness Design](#correctness-design)) — a duplicate is possible on redelivery. This is consistent with the rest of the pipeline: Kafka topics here carry at-least-once delivery, and true deduplication is the storage sink's job (upsert on ticker + timestamp + anomaly type) once it exists, not every intermediate hop's.
+
+---
+
 ## Repository Structure
 
 ```
 streamalpha/
 ├── ingestion/          # Alpaca WebSocket client, idempotent Kafka producer
-├── streaming/           # Kafka consumer: manual offsets, DLQ routing/replay
+├── streaming/           # Consumer (manual offsets, DLQ), windowing, online ML, persistence
 ├── storage/              # empty -- Postgres sink not yet built
 ├── backend/               # empty -- FastAPI backend not yet built
 ├── chaos/                  # empty -- load/fault-injection tests not yet built
 ├── notebooks/               # empty -- research notebook not yet added
 ├── tests/
 │   ├── ingestion/             # producer, Alpaca stream wiring, reconnect/shutdown logic
-│   └── streaming/               # schema validation, consumer, DLQ (52 tests total)
+│   └── streaming/               # schema, consumer, DLQ, aggregation, models, BOCPD, persistence
 ├── docker-compose.yml            # local Kafka (KRaft mode), topic bootstrap
 ├── requirements.txt
 └── .env.example
@@ -118,7 +143,9 @@ pytest tests/ -v
 # ingest live ticks into Kafka (Ctrl+C to stop cleanly)
 python -m ingestion
 
-# consume ticks, validate, route bad payloads to the DLQ (separate terminal)
+# consume ticks: validate + DLQ routing, windowed aggregation, online
+# anomaly detection, publishing to volume-anomalies/regime-changes
+# (separate terminal, Ctrl+C to stop cleanly)
 python -m streaming
 
 # inspect or replay DLQ'd messages after fixing whatever caused them
@@ -127,6 +154,8 @@ python -m streaming.dlq_tools replay --limit 20
 
 docker compose down
 ```
+
+Optional env vars for the anomaly pipeline (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling window size, default 10) and `MODEL_STATE_PATH` (where per-ticker model state is persisted, default `model_state.pkl` in the working directory).
 
 ---
 
@@ -139,17 +168,17 @@ docker compose down
 - A manual-offset, DLQ-routing consumer with schema validation, verified live: a malformed message is routed to `market-ticks-dlq` and its offset committed only after that write is durable; a valid tick is processed and committed; a processing exception is confirmed to leave the offset uncommitted.
 - `streaming/dlq_tools.py`, verified live: `inspect` correctly lists a DLQ'd record without consuming it destructively, and `replay` re-publishes it to `market-ticks` and is idempotent across repeated runs.
 - Clean shutdown (`SIGINT`/`SIGTERM`) verified on both the ingestion and consumer processes against real Kafka/Alpaca connections, not just in tests.
-- 52 unit tests across ingestion and streaming (offline, no live Kafka/Alpaca required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was.
+- Per-ticker windowed volume/volatility aggregation, online volume-spike detection (`HalfSpaceTrees`) and volatility regime-change detection (from-scratch BOCPD), periodic model state persistence, and publishing to `volume-anomalies`/`regime-changes` — all verified live end-to-end, not just in unit tests: a real `RegimeChange` event was produced by the running consumer and confirmed in Kafka, and a restart was confirmed to resume from saved state rather than start cold. See [Online Anomaly Detection](#online-anomaly-detection) for what works reliably versus what's an honestly-documented limitation.
+- 88 unit tests across ingestion and streaming (offline, no live Kafka/Alpaca required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, and for the BOCPD signal-selection bug found while building it.
 
-**Not yet built:** online ML (incremental isolation forest, Bayesian changepoint detection), the Postgres storage sink and its idempotent upsert, the cross-reference against alpha-signal-lab's factor moves, the FastAPI backend, the chaos/load testing harness, the dashboard, and deployment. `process_tick` in `streaming/run_consumer.py` currently just logs and counts ticks — it exists to exercise the consumer's correctness pattern end-to-end, not to detect anything yet.
+**Not yet built:** the Postgres storage sink and its idempotent upsert, the cross-reference against alpha-signal-lab's factor moves, the FastAPI backend, the chaos/load testing harness, the dashboard, and deployment.
 
 ---
 
 ## Future Work
 
-- Replace the placeholder tick processor with online anomaly detection: a per-ticker incremental isolation forest (or `river`'s `HalfSpaceTrees`) for volume/price outliers, and Bayesian online changepoint detection on rolling realized volatility for regime shifts — a deliberately different failure mode from a single-tick outlier.
-- Persist model state periodically so a consumer restart resumes learning instead of starting cold.
-- Idempotent Postgres sink (upsert on ticker + timestamp + anomaly type), completing the exactly-once story end to end.
+- Improve isolated-spike volume detection recall (see [Online Anomaly Detection](#online-anomaly-detection)) with richer features — recent volume trend, multiple lookback ratios — instead of raw windowed volume alone.
+- Idempotent Postgres sink (upsert on ticker + timestamp + anomaly type), completing the exactly-once story end to end and giving anomaly events a durable, queryable home.
 - Cross-reference detected anomalies against days alpha-signal-lab's factors moved sharply, reported honestly regardless of outcome.
 - FastAPI backend exposing live ticks, anomalies, and system health (consumer lag, DLQ depth, model freshness per ticker).
 - Chaos testing: burst load, a kill-and-restart test proving no ticks are lost or duplicated, and a WebSocket disconnect test.
