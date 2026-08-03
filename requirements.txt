@@ -1,3 +1,11 @@
+# Local dev only: everything Render's builds need lives in
+# requirements-base.txt instead, specifically because this next line can't
+# go there -- Render only clones streamalpha, so a relative sibling path
+# never resolves in that build environment. See render.yaml and this
+# file's own comment below for how each Render service actually gets
+# alpha-signal-lab (a git dependency, not this editable local path).
+-r requirements-base.txt
+
 # Editable local dependency on alpha-signal-lab, for config.universe and
 # (as of the cross-reference analysis) factors/data -- see
 # alpha-signal-lab/pyproject.toml for exactly what's packaged and why.
@@ -6,33 +14,4 @@
 # from, not against this file's location -- run `pip install -r
 # requirements.txt` from inside streamalpha/, not from elsewhere with a
 # `-r streamalpha/requirements.txt` pointer, or the path won't resolve.
-# Revisit this at deployment time: it won't resolve on a host that only
-# clones streamalpha.
 -e ../alpha-signal-lab
-
-confluent-kafka>=2.5
-alpaca-py>=0.30
-fastapi>=0.110
-uvicorn>=0.29
-httpx>=0.27              # FastAPI's TestClient (tests/backend/) depends on this, not served code
-sqlalchemy>=2.0
-psycopg[binary]>=3.1
-python-dotenv>=1.0
-pytest>=8.0
-ruff>=0.6
-
-# For analysis/cross_reference.py: alpha-signal-lab's factors/ and
-# data/prices.py need these; version pins match alpha-signal-lab's own
-# requirements.txt for consistency (both repos then agree on pandas'
-# actual behavior, not just its interface).
-pandas>=2.1
-numpy>=1.26
-pyarrow>=14.0
-yfinance>=0.2.40
-
-# For notebooks/research.ipynb -- same versions as alpha-signal-lab's own
-# requirements.txt.
-matplotlib>=3.8
-jupyter>=1.0
-nbformat>=5.10
-nbconvert>=7.16

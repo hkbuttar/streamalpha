@@ -11,6 +11,8 @@ from __future__ import annotations
 from confluent_kafka import OFFSET_INVALID, Consumer, TopicPartition
 from confluent_kafka.admin import AdminClient
 
+from kafka_config import kafka_client_config
+
 METADATA_TIMEOUT_SECONDS = 5.0
 
 
@@ -26,8 +28,8 @@ def consumer_group_lag(bootstrap_servers: str, group_id: str, topics: list[str])
     what that partition would actually have to work through once the
     group starts, not a misleadingly reassuring zero.
     """
-    admin = AdminClient({"bootstrap.servers": bootstrap_servers})
-    consumer = Consumer({"bootstrap.servers": bootstrap_servers, "group.id": group_id})
+    admin = AdminClient(kafka_client_config(bootstrap_servers))
+    consumer = Consumer({**kafka_client_config(bootstrap_servers), "group.id": group_id})
     try:
         cluster_metadata = admin.list_topics(timeout=METADATA_TIMEOUT_SECONDS)
         partitions = [
@@ -59,9 +61,9 @@ def topic_size(bootstrap_servers: str, topic: str) -> int:
     right concept there -- this reports "how many records are sitting in
     it right now" instead.
     """
-    admin = AdminClient({"bootstrap.servers": bootstrap_servers})
+    admin = AdminClient(kafka_client_config(bootstrap_servers))
     consumer = Consumer(
-        {"bootstrap.servers": bootstrap_servers, "group.id": "streamalpha-backend-topic-size"}
+        {**kafka_client_config(bootstrap_servers), "group.id": "streamalpha-backend-topic-size"}
     )
     try:
         cluster_metadata = admin.list_topics(topic, timeout=METADATA_TIMEOUT_SECONDS)

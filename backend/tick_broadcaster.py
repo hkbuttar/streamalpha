@@ -28,10 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 
 from confluent_kafka import Consumer, KafkaError
 
+from kafka_config import kafka_client_config
 from streaming.consumer import MARKET_TICKS_TOPIC
 
 log = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ class TickBroadcaster:
     async def _relay_loop(self) -> None:
         consumer = Consumer(
             {
-                "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+                **kafka_client_config(),
                 "group.id": GROUP_ID,
                 "enable.auto.commit": False,
                 "auto.offset.reset": "latest",

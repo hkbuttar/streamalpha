@@ -2,7 +2,7 @@
 
 Real-time market anomaly detection via Kafka. Online/streaming ML (a rolling z-score volume detector, from-scratch Bayesian changepoint detection) flags volume spikes and volatility regime shifts, built around an explicit exactly-once processing story. Extends [alpha-signal-lab](https://github.com/hkbuttar/alpha-signal-lab)'s equity universe with a true event-streaming architecture in place of that project's daily batch loop.
 
-> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), the idempotent Postgres sink, a cross-reference analysis against alpha-signal-lab's own factors, chaos testing (burst, kill, and disconnect tests against real infrastructure), a read-only FastAPI backend, and a React frontend dashboard are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is complete end to end and chaos-tested. Deployment is not yet built — see [Current Status](#current-status) for what's real versus what's planned.
+> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), the idempotent Postgres sink, a cross-reference analysis against alpha-signal-lab's own factors, chaos testing (burst, kill, and disconnect tests against real infrastructure), a read-only FastAPI backend, and a React frontend dashboard are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is complete end to end and chaos-tested. Deployment configuration (Render + Vercel, `render.yaml`) is written but not yet actually deployed to a live URL — see [Current Status](#current-status) for what's real versus what's planned.
 
 ---
 
@@ -16,10 +16,11 @@ Real-time market anomaly detection via Kafka. Online/streaming ML (a rolling z-s
 7. [Chaos Testing](#chaos-testing)
 8. [Backend](#backend)
 9. [Frontend](#frontend)
-10. [Repository Structure](#repository-structure)
-11. [Setup & Usage](#setup--usage)
-12. [Current Status](#current-status)
-13. [Future Work](#future-work)
+10. [Deployment](#deployment)
+11. [Repository Structure](#repository-structure)
+12. [Setup & Usage](#setup--usage)
+13. [Current Status](#current-status)
+14. [Future Work](#future-work)
 
 ---
 
@@ -207,6 +208,24 @@ No build-time coupling to the backend beyond the response shapes hand-mirrored i
 
 ---
 
+## Deployment
+
+**Configuration is written and follows alpha-signal-lab's own established deployment convention (`render.yaml` + Vercel) exactly, extended for the piece that project doesn't need: Kafka.** Unlike everything else in this README, none of this has actually been deployed to a live URL — that requires accounts and credentials on external services this assistant doesn't have and can't create. What follows is what's ready to deploy, and what's still a manual step for whoever runs it.
+
+- **Backend (`backend/main.py`) — Render, `render.yaml`.** One web service (`streamalpha-backend`), matching alpha-signal-lab's `render.yaml` almost exactly: same `runtime: python`, same `startCommand` shape (`uvicorn backend.main:app --host 0.0.0.0 --port $PORT`), same `fromDatabase` wiring for `DATABASE_URL`. `ALLOWED_ORIGINS` is `sync: false` (a placeholder Render prompts for at deploy time, not a real value committed to the repo) — set it to the Vercel URL once that exists, same two-step chicken-and-egg deploy order alpha-signal-lab's own README describes for itself.
+
+- **Three background workers — also Render, also `render.yaml`.** This is the part alpha-signal-lab genuinely doesn't need: `ingestion`, `streaming`, and `storage` are long-running Kafka consumer/producer loops, not request/response HTTP servers, so they're each declared as `type: worker` rather than `type: web` (no `$PORT` to bind). Whether Render's free plan currently covers worker services isn't asserted as fact in `render.yaml`'s comments — that's a real question to check against Render's current pricing before assuming `plan: free` works for these three, not something safe to guess at here.
+
+- **A real, known gap: `streaming`'s model state won't survive a Render redeploy as configured.** `MODEL_STATE_PATH` writes to local disk (`streaming/model_state.py`), and a Render worker's local disk isn't persistent across deploys by default. Every redeploy would start every ticker's model cold — not incorrect (see [Online Anomaly Detection](#online-anomaly-detection)'s warmup behavior), just a real loss of accumulated state that local dev doesn't have to think about. A [Render Disk](https://render.com/docs/disks) attached to the `streamalpha-streaming` service is the fix; not wired up here, flagged instead of silently left implicit.
+
+- **Managed Kafka — provider not chosen for you.** Local dev's `docker-compose.yml` Kafka needs no auth at all; a managed provider will need at least SASL_SSL credentials. Every `confluent_kafka` client in this project (other than `chaos/`'s deliberately local-only scripts) is now built through one shared function, `kafka_config.kafka_client_config()` (`kafka_config.py`), instead of each of the 8 call sites constructing its own config dict — so switching from local PLAINTEXT to an authenticated managed provider is purely `KAFKA_BOOTSTRAP_SERVERS` / `KAFKA_SECURITY_PROTOCOL` / `KAFKA_SASL_MECHANISM` / `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` env vars (see `.env.example`), not a code change. No specific provider is wired up or recommended as a deployment default here — that's a real cost/account decision for whoever deploys this, not something to pick unilaterally.
+
+- **Frontend (`frontend/`) — Vercel, zero-config.** Same as alpha-signal-lab's own React dashboard: Vercel auto-detects the Vite app, no `vercel.json` needed. Set `VITE_API_BASE_URL` (Vercel project env var) to the Render backend's URL once that exists.
+
+**A real bug found migrating every Kafka client to the shared config helper, unrelated to the migration itself.** While verifying the migration didn't change local behavior, `python -m streaming.dlq_tools inspect` hung indefinitely against the (real, currently empty) `market-ticks-dlq` topic — the first time that command had ever been run against a *genuinely* empty DLQ rather than one with real records to drain. Root cause, found by instrumenting `_drain()`'s loop directly against real Kafka: `PARTITION_EOF` can arrive on the very first poll of an empty topic, before a `consumer.assignment()` call made *before* that poll has any chance to reflect the rebalance poll() itself just completed. `assigned_count` stayed `None` forever, the one-time EOF event never satisfied the break condition, and no second EOF was ever coming to give it another chance -- confirmed by reverting the fix and watching a new offline regression test fail exactly as predicted (hits a bounded `_PollExhausted` after 20 polls instead of breaking after 1). Fixed by checking `assignment()` *inside* the EOF branch instead of once at the top of the loop -- a partition-specific EOF can only arrive for a partition already assigned, so checking right there is race-free by construction. `_drain()` had never been unit tested before (only exercised live, per its own module docstring); it has an offline regression test now. Re-verified live afterward: `inspect` and `replay` both return in about a second against the real, empty DLQ topic.
+
+---
+
 ## Repository Structure
 
 ```
@@ -225,8 +244,11 @@ streamalpha/
 │   ├── storage/                # anomaly schema validation, upsert SQL, sink consumer logic
 │   ├── analysis/               # factor z-score logic, anomaly-date matching, tz conversion
 │   ├── backend/                # kafka_admin lag/size math, /anomalies, /status, /ws/ticks, broadcaster
-│   └── test_shutdown.py        # ShutdownHandler, shared by ingestion/streaming/storage
+│   ├── test_shutdown.py        # ShutdownHandler, shared by ingestion/streaming/storage
+│   └── test_kafka_config.py    # kafka_client_config: PLAINTEXT default, SASL_SSL, empty-env-var fallback
 ├── shutdown.py                 # shared SIGINT/SIGTERM -> flag handler (see Correctness Design)
+├── kafka_config.py              # shared Kafka client config -- local PLAINTEXT or managed SASL_SSL
+├── render.yaml                  # Render Blueprint: backend + 3 workers + Postgres -- see Deployment
 ├── docker-compose.yml          # local Kafka (KRaft mode) + Postgres, topic bootstrap
 ├── requirements.txt
 └── .env.example
@@ -309,18 +331,21 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 - Per-ticker windowed volume/volatility aggregation, online volume-spike detection (rolling z-score on volume, 50/50-seed recall — see below) and volatility regime-change detection (from-scratch BOCPD), periodic model state persistence, and publishing to `volume-anomalies`/`regime-changes` — all verified live end-to-end, not just in unit tests: a real `RegimeChange` event and a real `VolumeAnomaly` event (z-score=83.2 on a synthetic spike) were each produced by the running consumer and confirmed, and a restart was confirmed to resume from saved state rather than start cold. See [Online Anomaly Detection](#online-anomaly-detection) for the volume detector's full before/after redesign.
 - An idempotent Postgres sink (`storage/`) completing the exactly-once story end to end, verified live: synthetic anomaly events produced to Kafka landed correctly in a single `anomalies` table, and a forced full redelivery of the same messages (consumer group offsets reset to earliest, sink rerun) left the row count unchanged with the original `detected_at` preserved — real Kafka redelivery, not just a direct call to the upsert function.
 - A cross-reference analysis (`analysis/cross_reference.py`) against alpha-signal-lab's own factor computation, run for real against streamalpha's live-detected anomalies and alpha-signal-lab's factors over real price history — see [Cross-Reference Analysis](#cross-reference-analysis) for the actual output and why n=2 doesn't support a general conclusion yet.
-- 149 unit tests across ingestion, streaming, storage, analysis, backend, and the shared shutdown handler (offline, no live Kafka/Alpaca/Postgres/network required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, a `pytest` test-collection bug found while adding storage's tests (and found again, the same way, while adding `tests/backend/`), the empty-env-var-crashes-`group.id` bug, a `numpy.bool_ is True/False` identity-check bug, a wrong assumption about how much synthetic price history is actually insufficient for the rolling factor windows, the `/ws/ticks` idle-disconnect leak, and the volume-detector redesign now asserting 20/20-seed recall instead of pinning a single known-good seed.
+- 157 unit tests across ingestion, streaming, storage, analysis, backend, and the shared shutdown/Kafka-config helpers (offline, no live Kafka/Alpaca/Postgres/network required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, a `pytest` test-collection bug found while adding storage's tests (and found again, the same way, while adding `tests/backend/`), the empty-env-var-crashes-`group.id` bug (and its `KAFKA_SECURITY_PROTOCOL` cousin, same bug class, found again while building `kafka_config.py`), a `numpy.bool_ is True/False` identity-check bug, a wrong assumption about how much synthetic price history is actually insufficient for the rolling factor windows, the `/ws/ticks` idle-disconnect leak, the volume-detector redesign now asserting 20/20-seed recall instead of pinning a single known-good seed, and `streaming/dlq_tools.py`'s `_drain()` EOF-detection race (see [Deployment](#deployment)) -- the first unit test that function ever had.
+- Every `confluent_kafka` client in the project (ingestion, streaming, storage, backend -- not `chaos/`'s deliberately local-only scripts) now built through one shared `kafka_config.kafka_client_config()` instead of 8 separately-duplicated config dicts, so a managed Kafka provider's SASL_SSL credentials are purely an env var away, not a code change. Migrating it surfaced a real, previously-latent bug in `streaming/dlq_tools.py` unrelated to the migration itself -- see [Deployment](#deployment) for the full race condition and fix.
+- Deployment configuration for Render (backend + 3 background workers + managed Postgres, `render.yaml`) and Vercel (frontend, zero-config), following alpha-signal-lab's own established deployment convention. Not yet actually deployed to a live URL -- see [Deployment](#deployment) for exactly what's ready versus what's still a manual step (accounts, a managed Kafka provider, secrets) for whoever runs it.
 - The shutdown-signal-handling pattern (`shutdown.ShutdownHandler`), extracted into one shared, tested module after being copy-pasted identically into `ingestion/run.py`, `streaming/consumer.py`, and `storage/sink.py`. Re-verified live post-refactor: `SIGTERM` against a running `python -m storage` and `python -m streaming` both still log the shutdown message and exit cleanly.
 - Chaos testing (`chaos/`) against real infrastructure: a burst test (8,000-message synthetic load, peak lag and recovery time measured), a kill test (`SIGKILL` deterministically landed in the exact commit-vs-durable-write race window, confirming no ticks lost and no duplicate rows despite confirmed real redelivery), and a disconnect test (real `pfctl` network block of Alpaca's host, confirming the connect-timeout watchdog and backoff/retry loop actually fire and reconnect). Also directly responsible for finding and fixing a real bug outside its own scope: Kafka's `log.dirs` was never pointed at the mounted `kafka-data` volume, so no topic had ever actually been durable across a container recreation. See [Chaos Testing](#chaos-testing) for real numbers and logs.
 - A read-only FastAPI backend (`backend/`) over anomalies, pipeline health, and a live tick relay, verified live end-to-end against real Kafka/Postgres — including a real concurrency bug found and fixed by testing its disconnect path specifically (an idle WebSocket client leaking its handler and Kafka consumer forever, hanging `uvicorn` on shutdown). See [Backend](#backend) for what broke and how it was confirmed fixed.
 - `notebooks/research.ipynb`, an executed (not template) notebook with real outputs: the real anomalies table as currently stored, a visualization of the volume detector's behavior on a synthetic isolated spike, a visualization of BOCPD's changepoint-probability dynamics on a synthetic volatility shift, and a live rerun of the cross-reference analysis.
 - A React + TypeScript + Vite frontend dashboard (`frontend/`), verified in a real browser (Playwright, not just a successful build) against the real running backend: live tick relay confirmed end-to-end by producing an actual Kafka message and watching it render, the real anomalies table and real `/status` numbers displayed correctly, both light and dark themes, zero console errors. See [Frontend](#frontend) for what was checked and how.
 
-**Not yet built:** deployment.
+**Not yet done:** actually deploying (creating the Render/Vercel/Kafka-provider accounts, provisioning, setting secrets, confirming live URLs work) -- the configuration is ready, that execution step isn't.
 
 ---
 
 ## Future Work
 
 - Revisit the cross-reference analysis once weeks of real anomalies have accumulated — n=2 is a working pipeline, not a result; a real finding (or honestly, a real absence of one) needs a much larger sample.
-- Managed Kafka + hosting for deployment, and a full write-up of results, limitations, and assumptions once there's something real to report.
+- Actually deploy: pick a managed Kafka provider, create the Render and Vercel accounts/projects, wire up the `sync: false` secrets in `render.yaml`, confirm the live URLs work end to end — then a full write-up of results, limitations, and assumptions once there's something real, live, and running unattended to report on.
+- Attach a [Render Disk](https://render.com/docs/disks) to `streamalpha-streaming` so `model_state.pkl` survives a redeploy instead of starting cold every time (see [Deployment](#deployment)).

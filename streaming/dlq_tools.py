@@ -23,13 +23,13 @@ import argparse
 import base64
 import json
 import logging
-import os
 import time
 from collections.abc import Callable
 
 from confluent_kafka import Consumer, KafkaError, Producer
 from dotenv import load_dotenv
 
+from kafka_config import kafka_client_config
 from streaming.dlq import DLQ_TOPIC
 
 log = logging.getLogger(__name__)
@@ -51,10 +51,25 @@ POLL_TIMEOUT_SECONDS = 2.0
 # poll() return a PARTITION_EOF pseudo-message exactly when a partition
 # has been read up to where its high watermark was when that read caught
 # up -- the built-in signal for "drained what was here," not a guess.
-
-
-def _bootstrap_servers() -> str:
-    return os.environ["KAFKA_BOOTSTRAP_SERVERS"]
+#
+# A fourth bug surfaced later, in this same "third attempt" implementation,
+# once the DLQ topic was genuinely empty for the first time (a good sign --
+# no malformed messages had occurred yet) rather than having real records
+# to drain first: `inspect` hung indefinitely. _drain() checked
+# consumer.assignment() once, before the very first poll() -- but on an
+# empty topic, PARTITION_EOF can arrive on that very first poll, before
+# assignment() (checked immediately before it, in the same iteration) has
+# any chance to reflect the rebalance that poll() itself just completed
+# internally. assigned_count stayed None forever, the one-time EOF event
+# was processed without ever satisfying the break condition, and no second
+# EOF was coming to give it another chance. Confirmed live (attach a debug
+# script and watch assignment() return [] the instant an EOF message is
+# already in hand), then reproduced offline with a fake Consumer for a
+# permanent regression test (tests/streaming/test_dlq_tools.py) -- _drain()
+# itself had never been unit tested before, only exercised live. Fixed by
+# checking assignment() *inside* the EOF branch instead of once at the top
+# of the loop: a partition-specific EOF can only arrive for a partition
+# already assigned, so checking right there is race-free by construction.
 
 
 def _original_location(envelope: dict) -> str:
@@ -69,17 +84,24 @@ def _drain(consumer: Consumer, limit: int, handle_message: Callable[[object], No
     messages have been handled, or every assigned partition has reported
     PARTITION_EOF (requires enable.partition.eof=True on the consumer).
     Returns the number handled.
+
+    assigned_count is (re-)checked inside the EOF branch, not once at the
+    top of the loop -- found live, on a genuinely empty DLQ topic
+    specifically: EOF can arrive on the very first substantive poll, before
+    a top-of-loop consumer.assignment() call (issued *before* that poll)
+    has any chance to observe the rebalance that poll() itself just
+    completed internally. assigned_count stayed None forever as a result,
+    the break condition could never fire, and the loop hung indefinitely
+    polling a topic with nothing left to receive. Checking assignment()
+    only when an EOF actually arrives sidesteps the race entirely: you
+    cannot receive a partition-specific EOF for a partition you are not
+    yet assigned to, so the rebalance is guaranteed complete by then.
     """
     handled = 0
     partitions_at_eof: set[tuple[str, int]] = set()
     assigned_count: int | None = None
 
     while handled < limit:
-        if assigned_count is None:
-            assignment = consumer.assignment()
-            if assignment:
-                assigned_count = len(assignment)
-
         msg = consumer.poll(POLL_TIMEOUT_SECONDS)
         if msg is None:
             continue
@@ -87,6 +109,9 @@ def _drain(consumer: Consumer, limit: int, handle_message: Callable[[object], No
         if msg.error():
             if msg.error().code() == KafkaError._PARTITION_EOF:
                 partitions_at_eof.add((msg.topic(), msg.partition()))
+                assignment = consumer.assignment()
+                if assignment:
+                    assigned_count = len(assignment)
                 if assigned_count is not None and len(partitions_at_eof) >= assigned_count:
                     break
                 continue
@@ -101,7 +126,7 @@ def _drain(consumer: Consumer, limit: int, handle_message: Callable[[object], No
 def inspect(limit: int) -> None:
     consumer = Consumer(
         {
-            "bootstrap.servers": _bootstrap_servers(),
+            **kafka_client_config(),
             "group.id": f"streamalpha-dlq-inspect-{int(time.time())}",
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
@@ -133,7 +158,7 @@ def inspect(limit: int) -> None:
 def replay(limit: int) -> None:
     consumer = Consumer(
         {
-            "bootstrap.servers": _bootstrap_servers(),
+            **kafka_client_config(),
             "group.id": REPLAY_GROUP_ID,
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
@@ -142,7 +167,7 @@ def replay(limit: int) -> None:
     )
     producer = Producer(
         {
-            "bootstrap.servers": _bootstrap_servers(),
+            **kafka_client_config(),
             "enable.idempotence": True,
             "acks": "all",
             "client.id": "streamalpha-dlq-replay",

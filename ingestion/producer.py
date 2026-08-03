@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 from confluent_kafka import Producer
+
+from kafka_config import kafka_client_config
 
 log = logging.getLogger(__name__)
 
@@ -31,10 +32,9 @@ class TickProducer:
     """Thin wrapper over confluent_kafka.Producer, configured for idempotence."""
 
     def __init__(self, bootstrap_servers: str | None = None) -> None:
-        bootstrap_servers = bootstrap_servers or os.environ["KAFKA_BOOTSTRAP_SERVERS"]
         self._producer = Producer(
             {
-                "bootstrap.servers": bootstrap_servers,
+                **kafka_client_config(bootstrap_servers),
                 "enable.idempotence": True,
                 "acks": "all",
                 "client.id": "streamalpha-ingestion",

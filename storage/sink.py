@@ -32,6 +32,7 @@ import os
 
 from confluent_kafka import Consumer, KafkaError
 
+from kafka_config import kafka_client_config
 from shutdown import ShutdownHandler
 from storage.db import get_connection, upsert_anomaly
 from storage.schema import AnomalyValidationError, parse_anomaly_event
@@ -61,7 +62,6 @@ def run_sink(
     _shutdown.install()
 
     topics = topics or [VOLUME_ANOMALIES_TOPIC, REGIME_CHANGES_TOPIC]
-    bootstrap_servers = bootstrap_servers or os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
     # .get(KEY, DEFAULT) is wrong here: a `.env` line like
     # `STORAGE_CONSUMER_GROUP=` sets the var to "" (present, not absent),
@@ -72,7 +72,7 @@ def run_sink(
     # isolation.
     consumer = Consumer(
         {
-            "bootstrap.servers": bootstrap_servers,
+            **kafka_client_config(bootstrap_servers),
             "group.id": group_id or os.environ.get("STORAGE_CONSUMER_GROUP") or DEFAULT_GROUP_ID,
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",

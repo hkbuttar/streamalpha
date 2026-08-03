@@ -45,6 +45,7 @@ from collections.abc import Callable
 
 from confluent_kafka import Consumer, KafkaError
 
+from kafka_config import kafka_client_config
 from shutdown import ShutdownHandler
 from streaming.dlq import DLQProducer
 from streaming.schema import TickValidationError, parse_tick
@@ -75,7 +76,6 @@ def run_consumer(
     _shutdown.install()
 
     topics = topics or [MARKET_TICKS_TOPIC]
-    bootstrap_servers = bootstrap_servers or os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
     # .get(KEY, DEFAULT) is wrong here: a `.env` line like `KAFKA_CONSUMER_GROUP=`
     # sets the var to "" (present, not absent), so .get's default never
@@ -85,7 +85,7 @@ def run_consumer(
     # exception), not a clean error.
     consumer = Consumer(
         {
-            "bootstrap.servers": bootstrap_servers,
+            **kafka_client_config(bootstrap_servers),
             "group.id": group_id or os.environ.get("KAFKA_CONSUMER_GROUP") or DEFAULT_GROUP_ID,
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",

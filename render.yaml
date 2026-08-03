@@ -1,0 +1,128 @@
+services:
+  - type: web
+    name: streamalpha-backend
+    runtime: python
+    plan: free
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: streamalpha-db
+          property: connectionString
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false # managed Kafka provider's bootstrap servers -- see README.md's Deployment section
+      - key: KAFKA_SECURITY_PROTOCOL
+        sync: false # e.g. SASL_SSL; leave unset only if your provider genuinely needs no auth
+      - key: KAFKA_SASL_MECHANISM
+        sync: false # e.g. PLAIN or SCRAM-SHA-256, per your provider
+      - key: KAFKA_SASL_USERNAME
+        sync: false
+      - key: KAFKA_SASL_PASSWORD
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false # set to your Vercel deployment URL(s), comma-separated, after the frontend is deployed
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+  # Background workers, not web services -- these are long-running Kafka
+  # consumer/producer loops (streaming/consumer.py's poll loop,
+  # ingestion/run.py's WebSocket connection), not request/response HTTP
+  # servers, so they don't bind $PORT the way streamalpha-backend does.
+  # `type: worker` is what Render calls this. Whether Render's free plan
+  # currently allows worker services (as opposed to just free web
+  # services) isn't something to assert with confidence here -- check
+  # Render's current pricing before assuming `plan: free` works for these
+  # three; `plan: starter` (paid) is the fallback if it doesn't.
+  - type: worker
+    name: streamalpha-ingestion
+    runtime: python
+    plan: free
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m ingestion
+    envVars:
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ALPACA_BASE_URL
+        value: https://paper-api.alpaca.markets
+      - key: ALPACA_DATA_FEED
+        value: iex
+      - key: ALPACA_MAX_SYMBOLS
+        sync: false # find this empirically against your account -- see .env.example
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false
+      - key: KAFKA_SECURITY_PROTOCOL
+        sync: false
+      - key: KAFKA_SASL_MECHANISM
+        sync: false
+      - key: KAFKA_SASL_USERNAME
+        sync: false
+      - key: KAFKA_SASL_PASSWORD
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+  - type: worker
+    name: streamalpha-streaming
+    runtime: python
+    plan: free
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m streaming
+    envVars:
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false
+      - key: KAFKA_SECURITY_PROTOCOL
+        sync: false
+      - key: KAFKA_SASL_MECHANISM
+        sync: false
+      - key: KAFKA_SASL_USERNAME
+        sync: false
+      - key: KAFKA_SASL_PASSWORD
+        sync: false
+      - key: KAFKA_CONSUMER_GROUP
+        sync: false
+      - key: ANOMALY_WINDOW_SECONDS
+        sync: false
+      - key: MODEL_STATE_PATH
+        sync: false # a Render worker's local disk isn't persistent across
+        # deploys/restarts by default -- model_state.pkl will start cold
+        # on every deploy unless a Render Disk is attached. Documented as
+        # a known gap in README.md's Deployment section, not solved here.
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+  - type: worker
+    name: streamalpha-storage
+    runtime: python
+    plan: free
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m storage
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: streamalpha-db
+          property: connectionString
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false
+      - key: KAFKA_SECURITY_PROTOCOL
+        sync: false
+      - key: KAFKA_SASL_MECHANISM
+        sync: false
+      - key: KAFKA_SASL_USERNAME
+        sync: false
+      - key: KAFKA_SASL_PASSWORD
+        sync: false
+      - key: STORAGE_CONSUMER_GROUP
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+databases:
+  - name: streamalpha-db
+    plan: free
