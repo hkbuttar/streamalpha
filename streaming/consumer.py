@@ -86,10 +86,16 @@ def run_consumer(
     topics = topics or [MARKET_TICKS_TOPIC]
     bootstrap_servers = bootstrap_servers or os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
+    # .get(KEY, DEFAULT) is wrong here: a `.env` line like `KAFKA_CONSUMER_GROUP=`
+    # sets the var to "" (present, not absent), so .get's default never
+    # fires and group.id ends up "". Confirmed to matter, not just
+    # theoretical: an empty group.id crashes confluent_kafka.Consumer with
+    # a native C assertion ("Consumer_init", not a catchable Python
+    # exception), not a clean error.
     consumer = Consumer(
         {
             "bootstrap.servers": bootstrap_servers,
-            "group.id": group_id or os.environ.get("KAFKA_CONSUMER_GROUP", DEFAULT_GROUP_ID),
+            "group.id": group_id or os.environ.get("KAFKA_CONSUMER_GROUP") or DEFAULT_GROUP_ID,
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
         }

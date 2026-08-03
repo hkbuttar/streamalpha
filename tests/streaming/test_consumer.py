@@ -250,3 +250,19 @@ def test_group_id_env_override(monkeypatch):
         run_consumer(lambda tick: None, bootstrap_servers="localhost:9092")
 
     assert fake_consumer.config["group.id"] == "custom-group"
+
+
+def test_group_id_falls_back_to_default_when_env_var_is_present_but_empty(monkeypatch):
+    """A `.env` line like `KAFKA_CONSUMER_GROUP=` sets the var to "" (present,
+    not absent) -- os.environ.get's default only fires for a genuinely
+    missing key, not an empty one. Confirmed live that this actually
+    matters, not just in theory: constructing a real confluent_kafka.Consumer
+    with group.id="" crashes with a native C assertion in Consumer_init,
+    not a catchable Python exception.
+    """
+    fake_consumer, _ = _wire(monkeypatch, [])
+    monkeypatch.setenv("KAFKA_CONSUMER_GROUP", "")
+    with pytest.raises(_QueueExhausted):
+        run_consumer(lambda tick: None, bootstrap_servers="localhost:9092")
+
+    assert fake_consumer.config["group.id"] == consumer_module.DEFAULT_GROUP_ID

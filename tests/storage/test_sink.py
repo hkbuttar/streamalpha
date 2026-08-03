@@ -245,3 +245,18 @@ def test_group_id_env_override(monkeypatch):
         run_sink(bootstrap_servers="localhost:9092")
 
     assert fake_consumer.config["group.id"] == "custom-group"
+
+
+def test_group_id_falls_back_to_default_when_env_var_is_present_but_empty(monkeypatch):
+    """A `.env` line like `STORAGE_CONSUMER_GROUP=` sets the var to ""
+    (present, not absent) -- confirmed live that a real confluent_kafka.Consumer
+    constructed with group.id="" crashes with a native C assertion in
+    Consumer_init, not a catchable Python exception. This was the actual
+    root cause of a real crash, not a hypothetical.
+    """
+    fake_consumer, _, _ = _wire(monkeypatch, [])
+    monkeypatch.setenv("STORAGE_CONSUMER_GROUP", "")
+    with pytest.raises(_QueueExhausted):
+        run_sink(bootstrap_servers="localhost:9092")
+
+    assert fake_consumer.config["group.id"] == sink_module.DEFAULT_GROUP_ID

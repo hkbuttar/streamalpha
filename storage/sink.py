@@ -72,10 +72,17 @@ def run_sink(
     topics = topics or [VOLUME_ANOMALIES_TOPIC, REGIME_CHANGES_TOPIC]
     bootstrap_servers = bootstrap_servers or os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
+    # .get(KEY, DEFAULT) is wrong here: a `.env` line like
+    # `STORAGE_CONSUMER_GROUP=` sets the var to "" (present, not absent),
+    # so .get's default never fires and group.id ends up "". Confirmed
+    # live: this crashed confluent_kafka.Consumer with a native C
+    # assertion ("Consumer_init"), not a catchable Python exception --
+    # reproduced by constructing a bare Consumer with group.id="" in
+    # isolation.
     consumer = Consumer(
         {
             "bootstrap.servers": bootstrap_servers,
-            "group.id": group_id or os.environ.get("STORAGE_CONSUMER_GROUP", DEFAULT_GROUP_ID),
+            "group.id": group_id or os.environ.get("STORAGE_CONSUMER_GROUP") or DEFAULT_GROUP_ID,
             "enable.auto.commit": False,
             "auto.offset.reset": "earliest",
         }

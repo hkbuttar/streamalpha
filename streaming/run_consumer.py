@@ -55,8 +55,12 @@ def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-    window_seconds = float(os.environ.get("ANOMALY_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS))
-    state_path = os.environ.get("MODEL_STATE_PATH", DEFAULT_STATE_PATH)
+    # .get(KEY, DEFAULT) is wrong here: a `.env` line like
+    # `ANOMALY_WINDOW_SECONDS=` sets the var to "" (present, not absent),
+    # so .get's default never fires. Confirmed live: this crashed with
+    # ValueError: could not convert string to float: ''.
+    window_seconds = float(os.environ.get("ANOMALY_WINDOW_SECONDS") or DEFAULT_WINDOW_SECONDS)
+    state_path = os.environ.get("MODEL_STATE_PATH") or DEFAULT_STATE_PATH
 
     models_by_symbol: dict[str, TickerModels] = load_state(state_path)
     if models_by_symbol:

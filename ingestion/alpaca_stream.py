@@ -75,7 +75,12 @@ def build_stream(producer: TickProducer) -> StockDataStream:
     every retry starts from a clean stream instance rather than reusing one
     that may be in a bad state.
     """
-    feed = DataFeed(os.environ.get("ALPACA_DATA_FEED", "iex"))
+    # .get(KEY, DEFAULT) is wrong here: a `.env` line like
+    # `ALPACA_DATA_FEED=` sets the var to "" (present, not absent), so
+    # .get's default never fires and DataFeed("") raises. See
+    # streaming/consumer.py's group.id fix for the same pattern catching a
+    # far worse failure mode (a native C crash) elsewhere in this project.
+    feed = DataFeed(os.environ.get("ALPACA_DATA_FEED") or "iex")
     stream = StockDataStream(
         api_key=os.environ["ALPACA_API_KEY"],
         secret_key=os.environ["ALPACA_SECRET_KEY"],
