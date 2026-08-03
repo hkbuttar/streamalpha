@@ -2,7 +2,7 @@
 
 Real-time market anomaly detection via Kafka. Online/streaming ML (incremental isolation forest, Bayesian changepoint detection) flags volume spikes and volatility regime shifts, built around an explicit exactly-once processing story. Extends [alpha-signal-lab](https://github.com/hkbuttar/alpha-signal-lab)'s equity universe with a true event-streaming architecture in place of that project's daily batch loop.
 
-> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), and the idempotent Postgres sink are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is now complete end to end. Backend, chaos testing, and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
+> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), the idempotent Postgres sink, and a cross-reference analysis against alpha-signal-lab's own factors are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is complete end to end. Backend, chaos testing, and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
 
 ---
 
@@ -12,10 +12,11 @@ Real-time market anomaly detection via Kafka. Online/streaming ML (incremental i
 3. [Data](#data)
 4. [Correctness Design](#correctness-design)
 5. [Online Anomaly Detection](#online-anomaly-detection)
-6. [Repository Structure](#repository-structure)
-7. [Setup & Usage](#setup--usage)
-8. [Current Status](#current-status)
-9. [Future Work](#future-work)
+6. [Cross-Reference Analysis](#cross-reference-analysis)
+7. [Repository Structure](#repository-structure)
+8. [Setup & Usage](#setup--usage)
+9. [Current Status](#current-status)
+10. [Future Work](#future-work)
 
 ---
 
@@ -109,6 +110,28 @@ Verified live end-to-end, not just in unit tests: a synthetic sustained volume/p
 
 ---
 
+## Cross-Reference Analysis
+
+`analysis/cross_reference.py` is what makes "extends alpha-signal-lab" concrete rather than a shared universe in name only: for each anomaly streamalpha detects, did the same ticker also have an unusually large day-over-day move in one of alpha-signal-lab's own factors around the same date? It reuses alpha-signal-lab's actual factor computation (`factors/momentum.py`, `volatility.py`, `mean_reversion.py`) via the same editable install `config.universe` already comes from — not a reimplementation of "big price move."
+
+**Scope decision:** momentum, volatility, and mean-reversion only, not sentiment. Sentiment needs a NewsAPI key and an LLM call per headline (`data/news.py`); that cost and complexity isn't warranted here, since this is checking against alpha-signal-lab's *price-based* read of a name, not reproducing its entire factor stack.
+
+**"Moved sharply" is defined per ticker, not cross-sectionally**, deliberately: for each factor, take the day-over-day change in that ticker's own score, then a rolling z-score of that change series against the ticker's *own* trailing history — not other tickers' same-day moves. This mirrors how streamalpha's own detectors work (per-ticker, not a cross-sectional comparison) and avoids conflating "this factor moved a lot for this name specifically" with a different question ("this factor moved a lot relative to the other 49 names today") that this analysis isn't asking.
+
+**This required expanding what streamalpha imports from alpha-signal-lab.** Through the anomaly-detection step, the editable install (`-e ../alpha-signal-lab`) was deliberately restricted to just `config.universe` — see Correctness Design's note on why. This step is the first genuine need for more: computing "the same factor score alpha-signal-lab would compute" means actually calling `factors/momentum.py` etc., not re-deriving the math independently (which would test nothing about whether the two projects' notions of a name's behavior agree). alpha-signal-lab's `pyproject.toml` packaging now also includes `factors` and `data` — still deliberately excluding `backtest/`, `risk/`, `live/`, since streamalpha has no reason to depend on trading, execution, or risk logic, only on factor computation and price loading.
+
+**Results, reported honestly at the sample size that actually exists.** As of writing, streamalpha has detected exactly 2 real anomalies (both `regime_change`, from live paper-account data): `COP` and `BMY`, both on 2026-08-03. Running the cross-reference (|z| ≥ 2.0, ±1 day window) against alpha-signal-lab's factors computed over the same tickers' trailing ~400 days of price history (via `data/prices.py`, `yfinance`):
+
+```
+1/2 detected anomalies coincided with a sharp alpha-signal-lab factor move (|z| >= 2.0, +/-1d window).
+  [no match] COP    regime_change   2026-08-03  []
+  [MATCH   ] BMY    regime_change   2026-08-03  [('momentum', Timestamp('2026-08-03'), 2.87)]
+```
+
+`BMY`'s regime change coincided with a real momentum z-score of 2.87 the same day; `COP`'s did not coincide with any factor move in the window. **n=2 is not a sample size anything can be concluded from** — this is reported as exactly what it is: the actual output of a real, working cross-reference, not a claim about whether streamalpha's anomalies and alpha-signal-lab's factors are related in general. That question needs weeks of accumulated detections to even start answering, which is why this section will be revisited (see Future Work) rather than written up as a finished result now.
+
+---
+
 ## Repository Structure
 
 ```
@@ -116,13 +139,15 @@ streamalpha/
 ├── ingestion/          # Alpaca WebSocket client, idempotent Kafka producer
 ├── streaming/           # Consumer (manual offsets, DLQ), windowing, online ML, persistence
 ├── storage/              # Idempotent Postgres sink: schema, upsert, manual-offset consumer
+├── analysis/              # Cross-reference detected anomalies against alpha-signal-lab's factors
 ├── backend/               # empty -- FastAPI backend not yet built
 ├── chaos/                  # empty -- load/fault-injection tests not yet built
 ├── notebooks/               # empty -- research notebook not yet added
 ├── tests/
 │   ├── ingestion/             # producer, Alpaca stream wiring, reconnect/shutdown logic
 │   ├── streaming/               # schema, consumer, DLQ, aggregation, models, BOCPD, persistence
-│   └── storage/                  # anomaly schema validation, upsert SQL, sink consumer logic
+│   ├── storage/                  # anomaly schema validation, upsert SQL, sink consumer logic
+│   └── analysis/                   # factor z-score logic, anomaly-date matching, tz conversion
 ├── docker-compose.yml            # local Kafka (KRaft mode) + Postgres, topic bootstrap
 ├── requirements.txt
 └── .env.example
@@ -159,6 +184,9 @@ python -m streaming
 # sink: upsert anomaly events into Postgres (separate terminal, Ctrl+C to stop cleanly)
 python -m storage
 
+# cross-reference detected anomalies against alpha-signal-lab's factors
+python -m analysis.cross_reference
+
 # inspect or replay DLQ'd messages after fixing whatever caused them
 python -m streaming.dlq_tools inspect --limit 20
 python -m streaming.dlq_tools replay --limit 20
@@ -181,9 +209,10 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 - Clean shutdown (`SIGINT`/`SIGTERM`) verified on both the ingestion and consumer processes against real Kafka/Alpaca connections, not just in tests.
 - Per-ticker windowed volume/volatility aggregation, online volume-spike detection (`HalfSpaceTrees`) and volatility regime-change detection (from-scratch BOCPD), periodic model state persistence, and publishing to `volume-anomalies`/`regime-changes` — all verified live end-to-end, not just in unit tests: a real `RegimeChange` event was produced by the running consumer and confirmed in Kafka, and a restart was confirmed to resume from saved state rather than start cold. See [Online Anomaly Detection](#online-anomaly-detection) for what works reliably versus what's an honestly-documented limitation.
 - An idempotent Postgres sink (`storage/`) completing the exactly-once story end to end, verified live: synthetic anomaly events produced to Kafka landed correctly in a single `anomalies` table, and a forced full redelivery of the same messages (consumer group offsets reset to earliest, sink rerun) left the row count unchanged with the original `detected_at` preserved — real Kafka redelivery, not just a direct call to the upsert function.
-- 111 unit tests across ingestion, streaming, and storage (offline, no live Kafka/Alpaca/Postgres required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, a `pytest` test-collection bug found while adding this step's tests, and the empty-env-var-crashes-`group.id` bug.
+- A cross-reference analysis (`analysis/cross_reference.py`) against alpha-signal-lab's own factor computation, run for real against streamalpha's live-detected anomalies and alpha-signal-lab's factors over real price history — see [Cross-Reference Analysis](#cross-reference-analysis) for the actual output and why n=2 doesn't support a general conclusion yet.
+- 121 unit tests across ingestion, streaming, storage, and analysis (offline, no live Kafka/Alpaca/Postgres/network required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, a `pytest` test-collection bug found while adding storage's tests, the empty-env-var-crashes-`group.id` bug, and (while adding this step's tests) a `numpy.bool_ is True/False` identity-check bug and a wrong assumption about how much synthetic price history is actually insufficient for the rolling factor windows.
 
-**Not yet built:** the cross-reference against alpha-signal-lab's factor moves, the FastAPI backend, the chaos/load testing harness, the dashboard, and deployment.
+**Not yet built:** the FastAPI backend, the chaos/load testing harness, the dashboard, and deployment.
 
 ---
 
@@ -191,7 +220,7 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 
 - Improve isolated-spike volume detection recall (see [Online Anomaly Detection](#online-anomaly-detection)) with richer features — recent volume trend, multiple lookback ratios — instead of raw windowed volume alone.
 - Extract the shutdown-signal-handling pattern, now duplicated three times (`ingestion/run.py`, `streaming/consumer.py`, `storage/sink.py`), into one shared, tested helper.
-- Cross-reference detected anomalies against days alpha-signal-lab's factors moved sharply, reported honestly regardless of outcome.
+- Revisit the cross-reference analysis once weeks of real anomalies have accumulated — n=2 is a working pipeline, not a result; a real finding (or honestly, a real absence of one) needs a much larger sample.
 - FastAPI backend exposing live ticks, anomalies, and system health (consumer lag, DLQ depth, model freshness per ticker) — including query helpers for the `anomalies` table, which `storage/db.py` currently only writes to.
 - Chaos testing: burst load, a kill-and-restart test proving no ticks are lost or duplicated, and a WebSocket disconnect test.
 - A frontend dashboard, managed Kafka + hosting for deployment, and a full write-up of results, limitations, and assumptions once there's something real to report.

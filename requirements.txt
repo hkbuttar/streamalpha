@@ -1,12 +1,13 @@
-# Editable local dependency on alpha-signal-lab, for config.universe (the
-# shared ticker universe) only -- see alpha-signal-lab/pyproject.toml for
-# why its packaging is restricted to just the config/ package. Assumes
-# alpha-signal-lab is checked out as a sibling directory. IMPORTANT: pip
-# resolves this relative path against the CWD it's invoked from, not against
-# this file's location -- run `pip install -r requirements.txt` from inside
-# streamalpha/, not from elsewhere with a `-r streamalpha/requirements.txt`
-# pointer, or the path won't resolve. Revisit this at deployment time: it
-# won't resolve on a host that only clones streamalpha.
+# Editable local dependency on alpha-signal-lab, for config.universe and
+# (as of the cross-reference analysis) factors/data -- see
+# alpha-signal-lab/pyproject.toml for exactly what's packaged and why.
+# Assumes alpha-signal-lab is checked out as a sibling directory.
+# IMPORTANT: pip resolves this relative path against the CWD it's invoked
+# from, not against this file's location -- run `pip install -r
+# requirements.txt` from inside streamalpha/, not from elsewhere with a
+# `-r streamalpha/requirements.txt` pointer, or the path won't resolve.
+# Revisit this at deployment time: it won't resolve on a host that only
+# clones streamalpha.
 -e ../alpha-signal-lab
 
 confluent-kafka>=2.5
@@ -19,3 +20,12 @@ psycopg[binary]>=3.1
 python-dotenv>=1.0
 pytest>=8.0
 ruff>=0.6
+
+# For analysis/cross_reference.py: alpha-signal-lab's factors/ and
+# data/prices.py need these; version pins match alpha-signal-lab's own
+# requirements.txt for consistency (both repos then agree on pandas'
+# actual behavior, not just its interface).
+pandas>=2.1
+numpy>=1.26
+pyarrow>=14.0
+yfinance>=0.2.40
