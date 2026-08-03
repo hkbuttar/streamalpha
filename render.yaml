@@ -4,7 +4,12 @@ services:
     runtime: python
     plan: free
     rootDir: .
-    buildCommand: pip install -r requirements.txt
+    # requirements-base.txt, not requirements.txt: the latter's -e
+    # ../alpha-signal-lab line only resolves when both repos are checked
+    # out as siblings, which Render's build environment never is (it
+    # clones only this repo). backend/main.py doesn't import anything
+    # from alpha-signal-lab anyway -- see README.md's Deployment section.
+    buildCommand: pip install -r requirements-base.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
@@ -40,7 +45,18 @@ services:
     runtime: python
     plan: free
     rootDir: .
-    buildCommand: pip install -r requirements.txt
+    # The one Render service that actually needs alpha-signal-lab
+    # (ingestion/alpaca_stream.py imports config.universe.UNIVERSE) --
+    # requirements-base.txt has everything else; alpha-signal-lab is
+    # installed separately from its public GitHub repo, since Render
+    # only clones streamalpha and the local editable path
+    # (-e ../alpha-signal-lab, requirements.txt) never resolves here.
+    # This needs alpha-signal-lab/pyproject.toml pushed to GitHub with
+    # real packaging metadata ([build-system]/[project]) for pip to be
+    # able to build it from a git URL at all.
+    buildCommand: >
+      pip install -r requirements-base.txt &&
+      pip install "alpha-signal-lab @ git+https://github.com/hkbuttar/alpha-signal-lab.git"
     startCommand: python -m ingestion
     envVars:
       - key: ALPACA_API_KEY
@@ -71,7 +87,9 @@ services:
     runtime: python
     plan: free
     rootDir: .
-    buildCommand: pip install -r requirements.txt
+    # requirements-base.txt -- streaming/ doesn't import from
+    # alpha-signal-lab at all; see the note on streamalpha-backend above.
+    buildCommand: pip install -r requirements-base.txt
     startCommand: python -m streaming
     envVars:
       - key: KAFKA_BOOTSTRAP_SERVERS
@@ -101,7 +119,9 @@ services:
     runtime: python
     plan: free
     rootDir: .
-    buildCommand: pip install -r requirements.txt
+    # requirements-base.txt -- storage/ doesn't import from
+    # alpha-signal-lab at all; see the note on streamalpha-backend above.
+    buildCommand: pip install -r requirements-base.txt
     startCommand: python -m storage
     envVars:
       - key: DATABASE_URL
