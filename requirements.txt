@@ -1,3 +1,14 @@
+# Editable local dependency on alpha-signal-lab, for config.universe (the
+# shared 49-name ticker universe) only -- see alpha-signal-lab/pyproject.toml
+# for why its packaging is restricted to just the config/ package. Assumes
+# alpha-signal-lab is checked out as a sibling directory. IMPORTANT: pip
+# resolves this relative path against the CWD it's invoked from, not against
+# this file's location -- run `pip install -r requirements.txt` from inside
+# streamalpha/, not from elsewhere with a `-r streamalpha/requirements.txt`
+# pointer, or the path won't resolve. Revisit at Step 10 deployment: this
+# won't resolve on a host that only clones streamalpha.
+-e ../alpha-signal-lab
+
 confluent-kafka>=2.5
 alpaca-py>=0.30
 river>=0.21
