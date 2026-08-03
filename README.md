@@ -2,7 +2,7 @@
 
 Real-time market anomaly detection via Kafka. Online/streaming ML (incremental isolation forest, Bayesian changepoint detection) flags volume spikes and volatility regime shifts, built around an explicit exactly-once processing story. Extends [alpha-signal-lab](https://github.com/hkbuttar/alpha-signal-lab)'s equity universe with a true event-streaming architecture in place of that project's daily batch loop.
 
-> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), and online anomaly detection (volume spikes, volatility regime changes) are built and verified against a live Alpaca paper account and a local Kafka broker. Storage, backend, chaos testing, and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
+> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), and the idempotent Postgres sink are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is now complete end to end. Backend, chaos testing, and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
 
 ---
 
@@ -38,8 +38,9 @@ flowchart LR
     C -->|valid tick| W[Per-ticker tumbling windows<br/>streaming/aggregation.py]
     W --> M[Volume + regime models<br/>streaming/models.py]
     M -->|idempotent producer| T3[(Kafka: volume-anomalies /<br/>regime-changes)]
+    T3 --> SK[Manual-offset sink<br/>storage/sink.py]
+    SK -->|idempotent upsert| S[(Postgres: anomalies)]
 
-    T3 -.not yet built.-> S[(Postgres sink)]
     S -.not yet built.-> B[FastAPI backend]
 ```
 
@@ -58,15 +59,15 @@ Solid boxes and arrows are built and verified; dashed ones are planned (see [Cur
 
 ## Correctness Design
 
-Exactly-once processing is treated as a deliberate design decision made of three independent legs, not a single setting to turn on. Two are built so far:
+Exactly-once processing is treated as a deliberate design decision made of three independent legs, not a single setting to turn on. All three are now built:
 
-**1. Idempotent producer (`ingestion/producer.py`).** `enable.idempotence=true` plus `acks=all` means librdkafka tags every message with a producer ID and a per-partition sequence number, so a retried send after a broker timeout or leader failover is recognized and deduplicated by the broker rather than appended twice. This only protects against *producer-side retries* — it says nothing about a consumer reprocessing a message after a crash, which is the next leg.
+**1. Idempotent producer (`ingestion/producer.py`, `streaming/anomaly_producer.py`).** `enable.idempotence=true` plus `acks=all` means librdkafka tags every message with a producer ID and a per-partition sequence number, so a retried send after a broker timeout or leader failover is recognized and deduplicated by the broker rather than appended twice. This only protects against *producer-side retries* — it says nothing about a consumer reprocessing a message after a crash, which is the next leg.
 
-**2. Manual offset commit + dead-letter queue (`streaming/consumer.py`, `streaming/dlq.py`).** Auto-commit is disabled. An offset is committed only after whatever that message required is durably done — either the tick was successfully handed to a processing callback, or (for malformed/schema-drifted payloads) it was durably written to `market-ticks-dlq`. Two distinct failure categories are handled two different ways on purpose:
-  - A payload that fails schema validation (`streaming/schema.py`) is bad data, not a bug in the consumer — it's routed to the DLQ instead of crashing the process or being silently dropped, with `streaming/dlq_tools.py` available to inspect and replay those records once the upstream issue is fixed.
+**2. Manual offset commit + dead-letter queue (`streaming/consumer.py`, `streaming/dlq.py`, `storage/sink.py`).** Auto-commit is disabled everywhere in this pipeline. An offset is committed only after whatever that message required is durably done — the tick was handed to a processing callback, a malformed payload was durably written to `market-ticks-dlq`, or (for the storage sink) an anomaly event was durably upserted into Postgres. Two distinct failure categories are handled two different ways on purpose:
+  - A payload that fails schema validation (`streaming/schema.py`) is bad data, not a bug in the consumer — it's routed to the DLQ instead of crashing the process or being silently dropped, with `streaming/dlq_tools.py` available to inspect and replay those records once the upstream issue is fixed. `storage/sink.py` deliberately has no DLQ of its own: its input topics are produced entirely by this project's own code, so a malformed payload there means a bug in *this* project, not upstream data drift — see `storage/schema.py`'s module docstring.
   - An exception raised by the processing callback itself is treated as a real bug, not bad data, and is deliberately **not** caught: it propagates and crashes the consumer, leaving the offset uncommitted so the same message is redelivered and reprocessed on restart. Catching and swallowing it here would trade that guarantee away for uptime, silently.
 
-**3. Idempotent storage sink** — not built yet. This is what will close the loop (upsert on ticker + timestamp + anomaly type), so a DLQ replay or a consumer restart can't produce duplicate rows.
+**3. Idempotent storage sink (`storage/db.py`, `storage/sink.py`).** A single `anomalies` table holds both volume anomalies and regime changes (type-specific fields live in a JSONB `details` column, the same pattern alpha-signal-lab's own `portfolio_snapshots.positions_json` uses for similarly flexible data), with a `UNIQUE (ticker, window_start, anomaly_type)` constraint and an `ON CONFLICT ... DO UPDATE` upsert. Verified live, not just by inspection: produced synthetic events to Kafka, ran the sink, confirmed 2 rows in Postgres; reset the consumer group's offsets to earliest to force full redelivery of the same messages, reran the sink, and confirmed the row count stayed at 2 with the original `detected_at` timestamp preserved (only `details` refreshed) — real redelivery through Kafka, not a direct call to the upsert function.
 
 **Cross-repo dependency.** `config.universe` is imported from alpha-signal-lab as a live editable install (`-e ../alpha-signal-lab` in `requirements.txt`), not copied, so the two projects can't silently drift apart on what "the universe" means. This only works with both repos checked out as sibling directories locally; it will need to become a git dependency or a vendored copy once this is deployed somewhere that only clones streamalpha.
 
@@ -75,6 +76,10 @@ Exactly-once processing is treated as a deliberate design decision made of three
 **The same shutdown bug class, again, in a completely different C extension.** `streaming/consumer.py`'s `consumer.poll()` blocks inside librdkafka's C code even though it's called with a 1-second timeout — attaching `lldb` to a hung consumer process showed the main thread stuck in `cnd_timedwait_abs` well over a minute after `Ctrl+C`, the identical shape of the `ingestion/run.py` bug but in a totally unrelated library. That's no longer treated as a one-off: the rule adopted project-wide is that no blocking call into a C extension, timeout or not, can be trusted to let a pending signal through promptly, and every consume loop uses the same custom-`signal.signal()`-plus-cooperative-flag pattern instead of relying on `KeyboardInterrupt`.
 
 **`streaming/dlq_tools.py`'s "when is a drain done" logic took three attempts, all caught live.** First: stop on the very first empty poll — wrong, `inspect` reported "0 records" against a topic `kafka-console-consumer` could read from immediately afterward, because a fresh consumer group's rebalance takes a few seconds and an empty poll during that window looks identical to no data. Second: require several consecutive empty polls before giving up — better, but still wrong on this topic's 3 partitions (`inspect` found 7 records while a `replay` run moments later found 20 more). Third attempt precomputed an exact count via `get_watermark_offsets` on the same consumer about to fetch from those partitions — this one didn't just under- or over-count, it got a real `replay` run stuck indefinitely one message from the end, a message independently confirmed present and readable the whole time. The actual fix was to stop reinventing exhaustion detection and use the Kafka client's own mechanism for it: `enable.partition.eof`, which makes `poll()` return a `PARTITION_EOF` pseudo-message exactly when a partition is drained. Re-verified live afterward: a `replay` run that had been stuck for minutes on the last message completed in 3.2 seconds once this landed.
+
+**`storage/sink.py` duplicates `streaming/consumer.py`'s shutdown-signal pattern rather than sharing it.** By this point the same custom-`signal.signal()`-plus-flag fix had been derived twice from scratch, in two different C extensions, so copying the now-validated ~20 lines a third time was judged lower risk than refactoring two already-tested modules to share one helper mid-project. Noted here as reasonable future cleanup, not left silent.
+
+**A real `pytest` bug, not a Kafka one, while adding `storage/`'s tests.** `tests/storage/test_schema.py` and the pre-existing `tests/streaming/test_schema.py` share a basename, and neither test directory has an `__init__.py` — pytest's import system collided on the two, failing collection entirely. The first fix tried, adding `__init__.py` to the test directories, made it worse: `tests/ingestion/__init__.py` turned `tests/ingestion` into a package literally named `ingestion`, which then shadowed the real top-level `ingestion` package for every `from ingestion import ...` in that directory's own tests. Reverted, and fixed the narrower way instead: renamed the one genuinely colliding file (`tests/storage/test_schema.py` → `test_anomaly_schema.py`), leaving the working `tests/ingestion/` and `tests/streaming/` layouts untouched.
 
 ---
 
@@ -98,7 +103,7 @@ Verified live end-to-end, not just in unit tests: a synthetic sustained volume/p
 
 **Model state persistence (`streaming/model_state.py`).** Each `TickerModels` instance (the `HalfSpaceTrees` pipeline and this project's own BOCPD state) is plain Python objects and pickles cleanly — confirmed by round-tripping trained state through `pickle.dumps`/`loads` before relying on it. State is saved periodically and on clean shutdown, written atomically (temp file + `os.replace`) so a crash mid-write can't corrupt the file for the next startup, and loaded back on startup — verified live: a second consumer run against the same state file logged `resumed model state for 1 ticker(s)` rather than starting cold.
 
-**At-least-once, not exactly-once, for anomaly events specifically.** If a tick produces two anomaly events and publishing the second one fails, the first may already be durably published before the exception propagates and crashes the consumer (per the design in [Correctness Design](#correctness-design)) — a duplicate is possible on redelivery. This is consistent with the rest of the pipeline: Kafka topics here carry at-least-once delivery, and true deduplication is the storage sink's job (upsert on ticker + timestamp + anomaly type) once it exists, not every intermediate hop's.
+**At-least-once, not exactly-once, for anomaly events specifically.** If a tick produces two anomaly events and publishing the second one fails, the first may already be durably published before the exception propagates and crashes the consumer (per the design in [Correctness Design](#correctness-design)) — a duplicate is possible on redelivery. This is fine: Kafka topics here carry at-least-once delivery, and true deduplication is the storage sink's job (`storage/db.py`'s upsert on ticker + window_start + anomaly type), which is what makes a duplicate publish harmless rather than something worth preventing at every intermediate hop.
 
 ---
 
@@ -108,14 +113,15 @@ Verified live end-to-end, not just in unit tests: a synthetic sustained volume/p
 streamalpha/
 ├── ingestion/          # Alpaca WebSocket client, idempotent Kafka producer
 ├── streaming/           # Consumer (manual offsets, DLQ), windowing, online ML, persistence
-├── storage/              # empty -- Postgres sink not yet built
+├── storage/              # Idempotent Postgres sink: schema, upsert, manual-offset consumer
 ├── backend/               # empty -- FastAPI backend not yet built
 ├── chaos/                  # empty -- load/fault-injection tests not yet built
 ├── notebooks/               # empty -- research notebook not yet added
 ├── tests/
 │   ├── ingestion/             # producer, Alpaca stream wiring, reconnect/shutdown logic
-│   └── streaming/               # schema, consumer, DLQ, aggregation, models, BOCPD, persistence
-├── docker-compose.yml            # local Kafka (KRaft mode), topic bootstrap
+│   ├── streaming/               # schema, consumer, DLQ, aggregation, models, BOCPD, persistence
+│   └── storage/                  # anomaly schema validation, upsert SQL, sink consumer logic
+├── docker-compose.yml            # local Kafka (KRaft mode) + Postgres, topic bootstrap
 ├── requirements.txt
 └── .env.example
 ```
@@ -132,8 +138,8 @@ source .venv/bin/activate
 pip install -r requirements.txt        # must run from streamalpha/, see requirements.txt
 cp .env.example .env                   # fill in ALPACA_API_KEY / ALPACA_SECRET_KEY
 
-# local Kafka
-docker compose up -d kafka
+# local Kafka + Postgres
+docker compose up -d kafka postgres
 docker compose up kafka-init           # creates market-ticks, market-ticks-dlq,
                                         # volume-anomalies, regime-changes; exits when done
 
@@ -148,6 +154,9 @@ python -m ingestion
 # (separate terminal, Ctrl+C to stop cleanly)
 python -m streaming
 
+# sink: upsert anomaly events into Postgres (separate terminal, Ctrl+C to stop cleanly)
+python -m storage
+
 # inspect or replay DLQ'd messages after fixing whatever caused them
 python -m streaming.dlq_tools inspect --limit 20
 python -m streaming.dlq_tools replay --limit 20
@@ -155,7 +164,7 @@ python -m streaming.dlq_tools replay --limit 20
 docker compose down
 ```
 
-Optional env vars for the anomaly pipeline (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling window size, default 10) and `MODEL_STATE_PATH` (where per-ticker model state is persisted, default `model_state.pkl` in the working directory).
+Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling window size, default 10), `MODEL_STATE_PATH` (where per-ticker model state is persisted, default `model_state.pkl` in the working directory), and `STORAGE_CONSUMER_GROUP` (default `streamalpha-storage-sink`). `DATABASE_URL` is required for `python -m storage`; docker-compose's local `postgres` service listens on port 5433, not 5432 (see `docker-compose.yml` for why).
 
 ---
 
@@ -169,17 +178,18 @@ Optional env vars for the anomaly pipeline (see `.env.example`): `ANOMALY_WINDOW
 - `streaming/dlq_tools.py`, verified live: `inspect` correctly lists a DLQ'd record without consuming it destructively, and `replay` re-publishes it to `market-ticks` and is idempotent across repeated runs.
 - Clean shutdown (`SIGINT`/`SIGTERM`) verified on both the ingestion and consumer processes against real Kafka/Alpaca connections, not just in tests.
 - Per-ticker windowed volume/volatility aggregation, online volume-spike detection (`HalfSpaceTrees`) and volatility regime-change detection (from-scratch BOCPD), periodic model state persistence, and publishing to `volume-anomalies`/`regime-changes` — all verified live end-to-end, not just in unit tests: a real `RegimeChange` event was produced by the running consumer and confirmed in Kafka, and a restart was confirmed to resume from saved state rather than start cold. See [Online Anomaly Detection](#online-anomaly-detection) for what works reliably versus what's an honestly-documented limitation.
-- 88 unit tests across ingestion and streaming (offline, no live Kafka/Alpaca required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, and for the BOCPD signal-selection bug found while building it.
+- An idempotent Postgres sink (`storage/`) completing the exactly-once story end to end, verified live: synthetic anomaly events produced to Kafka landed correctly in a single `anomalies` table, and a forced full redelivery of the same messages (consumer group offsets reset to earliest, sink rerun) left the row count unchanged with the original `detected_at` preserved — real Kafka redelivery, not just a direct call to the upsert function.
+- 109 unit tests across ingestion, streaming, and storage (offline, no live Kafka/Alpaca/Postgres required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, and a `pytest` test-collection bug found while adding this step's tests.
 
-**Not yet built:** the Postgres storage sink and its idempotent upsert, the cross-reference against alpha-signal-lab's factor moves, the FastAPI backend, the chaos/load testing harness, the dashboard, and deployment.
+**Not yet built:** the cross-reference against alpha-signal-lab's factor moves, the FastAPI backend, the chaos/load testing harness, the dashboard, and deployment.
 
 ---
 
 ## Future Work
 
 - Improve isolated-spike volume detection recall (see [Online Anomaly Detection](#online-anomaly-detection)) with richer features — recent volume trend, multiple lookback ratios — instead of raw windowed volume alone.
-- Idempotent Postgres sink (upsert on ticker + timestamp + anomaly type), completing the exactly-once story end to end and giving anomaly events a durable, queryable home.
+- Extract the shutdown-signal-handling pattern, now duplicated three times (`ingestion/run.py`, `streaming/consumer.py`, `storage/sink.py`), into one shared, tested helper.
 - Cross-reference detected anomalies against days alpha-signal-lab's factors moved sharply, reported honestly regardless of outcome.
-- FastAPI backend exposing live ticks, anomalies, and system health (consumer lag, DLQ depth, model freshness per ticker).
+- FastAPI backend exposing live ticks, anomalies, and system health (consumer lag, DLQ depth, model freshness per ticker) — including query helpers for the `anomalies` table, which `storage/db.py` currently only writes to.
 - Chaos testing: burst load, a kill-and-restart test proving no ticks are lost or duplicated, and a WebSocket disconnect test.
 - A frontend dashboard, managed Kafka + hosting for deployment, and a full write-up of results, limitations, and assumptions once there's something real to report.

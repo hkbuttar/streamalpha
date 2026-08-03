@@ -44,5 +44,27 @@ services:
       /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --list
       "
 
+  # Local dev/test only -- same reasoning as kafka above: production points
+  # DATABASE_URL at a managed Postgres instead (see .env.example). Host
+  # port is 5433, not the default 5432: this machine already has an
+  # unrelated alpha-signal-lab-pg container bound to 5432.
+  postgres:
+    image: postgres:16-alpine
+    container_name: streamalpha-postgres
+    environment:
+      POSTGRES_USER: streamalpha
+      POSTGRES_PASSWORD: streamalpha
+      POSTGRES_DB: streamalpha
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streamalpha"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
   kafka-data:
+  postgres-data:
