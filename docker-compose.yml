@@ -27,7 +27,7 @@ services:
   # One-shot: creates the topics this project needs against the single local
   # broker above, then exits. Re-running docker-compose up is idempotent
   # (--if-not-exists). Partition counts are for local dev only -- revisit
-  # when moving to managed Kafka in Step 10.
+  # when moving to a managed Kafka provider for deployment.
   kafka-init:
     image: apache/kafka:3.8.0
     depends_on:

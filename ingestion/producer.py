@@ -9,9 +9,9 @@ number and drops the duplicate instead of appending it twice.
 This only guards against *producer-side retries*. It does not dedupe a tick
 we hand to publish() twice ourselves, and it says nothing about what happens
 downstream if a consumer reprocesses a message after a crash -- that is what
-Step 3 (manual offset commit) and Step 5 (upsert on ticker+timestamp+type)
-are for. All three legs together are what make the pipeline exactly-once
-end to end; this module is only one of them.
+the consumer's manual offset commit (streaming/consumer.py) and an idempotent
+upsert on the storage sink are for. All three legs together are what make
+the pipeline exactly-once end to end; this module is only one of them.
 """
 
 from __future__ import annotations
@@ -47,9 +47,8 @@ class TickProducer:
         Keying by symbol (rather than letting the producer round-robin
         across partitions) guarantees every message for a given ticker
         lands in the same partition in send order. That per-partition
-        ordering is what lets Step 4's per-ticker online models consume
-        ticks in order without needing to reorder across partitions
-        themselves.
+        ordering is what lets a per-ticker online model consume ticks in
+        order without needing to reorder across partitions itself.
         """
         self._producer.produce(
             MARKET_TICKS_TOPIC,

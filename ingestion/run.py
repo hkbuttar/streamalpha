@@ -1,8 +1,8 @@
 """Entrypoint: run the Alpaca stream -> Kafka producer pipeline, supervised
 with backoff.
 
-Reconnect/backoff behavior, documented explicitly (this is Step 2's stated
-requirement, not incidental detail):
+Reconnect/backoff behavior, documented explicitly since it's easy to get
+wrong silently:
 
 Transient drops. A normal disconnect (network blip, server-side reset)
 surfaces inside alpaca-py's StockDataStream as a websockets.WebSocketException.
