@@ -15,12 +15,12 @@ import logging
 import os
 from datetime import UTC, datetime
 
-from confluent_kafka import Consumer, KafkaError
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.kafka_admin import consumer_group_lag, topic_size
+from backend.tick_broadcaster import TickBroadcaster
 from storage.db import get_connection, list_anomalies
 from storage.sink import DEFAULT_GROUP_ID as STORAGE_GROUP_ID
 from storage.sink import REGIME_CHANGES_TOPIC, VOLUME_ANOMALIES_TOPIC
@@ -42,6 +42,8 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+_broadcaster = TickBroadcaster()
 
 
 def _bootstrap_servers() -> str:
@@ -98,13 +100,10 @@ def status() -> dict:
 async def ws_ticks(websocket: WebSocket) -> None:
     """Relays raw market-ticks payloads to the client as-is, in real time.
 
-    A fresh, unique consumer group per connection, reading from "latest":
-    each connection sees ticks from the moment it connects onward, and
-    connections don't compete for partitions or share offsets with each
-    other or with the real streaming consumer. This leaves one stale
-    consumer-group entry behind per past connection (never cleaned up) --
-    an acceptable simplification at this project's current scale, not
-    something to build shared-broadcast/group-cleanup machinery for yet.
+    Fans out from one shared Kafka consumer (backend/tick_broadcaster.py)
+    instead of opening a new one per connection -- the original version
+    gave each connection its own consumer group, which left a permanent,
+    never-cleaned-up group behind in Kafka for every past connection.
 
     No schema validation here (unlike streaming/consumer.py): this is a
     read-only passthrough for display, not the correctness-critical path,
@@ -114,34 +113,19 @@ async def ws_ticks(websocket: WebSocket) -> None:
     try/except around send_text() -- confirmed live that the obvious
     version (catch WebSocketDisconnect around the send) leaks forever: a
     client that disconnects while idle (no new ticks to send) is never
-    discovered, since the loop never attempts a send at all, it just polls
-    Kafka and sleeps. That also means uvicorn hangs on shutdown waiting
-    for the handler to finish. Racing the Kafka-relay loop against a task
-    that awaits websocket.receive() (which surfaces the disconnect
-    regardless of whether anything was being sent) fixes both.
+    discovered, since the loop never attempts a send at all, it just waits
+    on the queue. That also means uvicorn hangs on shutdown waiting for
+    the handler to finish. Racing the relay loop against a task that
+    awaits websocket.receive() (which surfaces the disconnect regardless
+    of whether anything was being sent) fixes both.
     """
     await websocket.accept()
-    consumer = Consumer(
-        {
-            "bootstrap.servers": _bootstrap_servers(),
-            "group.id": f"streamalpha-backend-ws-{id(websocket)}",
-            "auto.offset.reset": "latest",
-        }
-    )
-    consumer.subscribe([MARKET_TICKS_TOPIC])
+    queue = _broadcaster.subscribe()
 
     async def _relay() -> None:
         while True:
-            msg = consumer.poll(0)
-            if msg is None:
-                await asyncio.sleep(0.1)
-                continue
-            if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    continue
-                log.warning("ws_ticks consumer error: %s", msg.error())
-                continue
-            await websocket.send_text(msg.value().decode("utf-8"))
+            payload = await queue.get()
+            await websocket.send_text(payload)
 
     async def _wait_for_disconnect() -> None:
         while True:
@@ -156,4 +140,4 @@ async def ws_ticks(websocket: WebSocket) -> None:
     finally:
         relay_task.cancel()
         disconnect_task.cancel()
-        consumer.close()
+        _broadcaster.unsubscribe(queue)

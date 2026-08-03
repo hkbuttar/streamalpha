@@ -1,7 +1,15 @@
 """backend/main.py tests. No real Kafka/Postgres: get_connection,
-list_anomalies, consumer_group_lag, topic_size, load_state, and the
-WebSocket's Consumer are all faked/monkeypatched at the point backend/main.py
-imported them, following the same pattern as tests/streaming/test_consumer.py.
+list_anomalies, consumer_group_lag, topic_size, load_state, and (for the
+WebSocket tests) the tick broadcaster's Consumer are all
+faked/monkeypatched at the point they were imported, following the same
+pattern as tests/streaming/test_consumer.py.
+
+The /ws/ticks tests patch main_module._broadcaster with a fresh
+TickBroadcaster() rather than using the real module-level singleton --
+that singleton is constructed once at import time and its relay task, once
+started, keeps running for the rest of the test session (see
+tick_broadcaster.py's module docstring for why), so reusing it across
+tests would leak state between them.
 """
 
 from __future__ import annotations
@@ -9,6 +17,8 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from backend import main as main_module
+from backend import tick_broadcaster as broadcaster_module
+from backend.tick_broadcaster import TickBroadcaster
 
 
 class _FakeTickMessage:
@@ -141,37 +151,43 @@ def test_status_assembles_lag_dlq_and_model_freshness(monkeypatch):
     assert len(lag_calls) == 2
 
 
-def test_ws_ticks_relays_raw_payload_and_subscribes_to_market_ticks(monkeypatch):
-    tick_bytes = b'{"type": "trade", "symbol": "AAPL"}'
-    fake_consumer = _FakeTicksConsumer(config=None, messages=[_FakeTickMessage(tick_bytes)])
-    monkeypatch.setattr(main_module, "Consumer", lambda config: fake_consumer)
+def _wire_broadcaster(monkeypatch, messages):
+    fake_consumer = _FakeTicksConsumer(config=None, messages=messages)
+    monkeypatch.setattr(broadcaster_module, "Consumer", lambda config: fake_consumer)
     monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    broadcaster = TickBroadcaster()
+    monkeypatch.setattr(main_module, "_broadcaster", broadcaster)
+    return fake_consumer, broadcaster
+
+
+def test_ws_ticks_relays_raw_payload_via_the_shared_broadcaster(monkeypatch):
+    tick_bytes = b'{"type": "trade", "symbol": "AAPL"}'
+    fake_consumer, broadcaster = _wire_broadcaster(
+        monkeypatch, messages=[_FakeTickMessage(tick_bytes)]
+    )
 
     client = TestClient(main_module.app)
     with client.websocket_connect("/ws/ticks") as ws:
         received = ws.receive_text()
         assert received == tick_bytes.decode("utf-8")
 
-    assert fake_consumer.subscribed == [main_module.MARKET_TICKS_TOPIC]
-    assert fake_consumer.closed is True
+    assert fake_consumer.subscribed == [broadcaster_module.MARKET_TICKS_TOPIC]
+    assert broadcaster._subscribers == set()  # unsubscribed on disconnect
 
 
 def test_ws_ticks_cleans_up_on_disconnect_even_with_no_messages_ever_sent(monkeypatch):
     """Regression test for a real bug found running this live: a client
     disconnecting while idle (no ticks to relay) was never noticed by the
     old try/except-around-send_text() design, since the loop never
-    attempted a send at all -- it just polled Kafka and slept, leaking the
-    connection and its Kafka consumer forever (and hanging uvicorn on
-    shutdown, waiting for a handler that would never finish). Disconnect
-    detection now runs as its own concurrent task instead of piggybacking
-    on send_text() failing.
+    attempted a send at all -- it just waited on its queue. That also
+    meant uvicorn hung on shutdown, waiting for a handler that would never
+    finish. Disconnect detection now runs as its own concurrent task
+    instead of piggybacking on send_text() failing.
     """
-    fake_consumer = _FakeTicksConsumer(config=None, messages=[])
-    monkeypatch.setattr(main_module, "Consumer", lambda config: fake_consumer)
-    monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    _, broadcaster = _wire_broadcaster(monkeypatch, messages=[])
 
     client = TestClient(main_module.app)
     with client.websocket_connect("/ws/ticks"):
         pass
 
-    assert fake_consumer.closed is True
+    assert broadcaster._subscribers == set()
