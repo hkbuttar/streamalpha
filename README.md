@@ -82,7 +82,7 @@ Exactly-once processing is treated as a deliberate design decision made of three
 
 **`streaming/dlq_tools.py`'s "when is a drain done" logic took three attempts, all caught live.** First: stop on the very first empty poll — wrong, `inspect` reported "0 records" against a topic `kafka-console-consumer` could read from immediately afterward, because a fresh consumer group's rebalance takes a few seconds and an empty poll during that window looks identical to no data. Second: require several consecutive empty polls before giving up — better, but still wrong on this topic's 3 partitions (`inspect` found 7 records while a `replay` run moments later found 20 more). Third attempt precomputed an exact count via `get_watermark_offsets` on the same consumer about to fetch from those partitions — this one didn't just under- or over-count, it got a real `replay` run stuck indefinitely one message from the end, a message independently confirmed present and readable the whole time. The actual fix was to stop reinventing exhaustion detection and use the Kafka client's own mechanism for it: `enable.partition.eof`, which makes `poll()` return a `PARTITION_EOF` pseudo-message exactly when a partition is drained. Re-verified live afterward: a `replay` run that had been stuck for minutes on the last message completed in 3.2 seconds once this landed.
 
-**`storage/sink.py` duplicates `streaming/consumer.py`'s shutdown-signal pattern rather than sharing it.** By this point the same custom-`signal.signal()`-plus-flag fix had been derived twice from scratch, in two different C extensions, so copying the now-validated ~20 lines a third time was judged lower risk than refactoring two already-tested modules to share one helper mid-project. Noted here as reasonable future cleanup, not left silent.
+**The shutdown-signal pattern was copy-pasted three times before being extracted.** The same custom-`signal.signal()`-plus-flag fix (see below) was independently derived from scratch in `ingestion/run.py`, then `streaming/consumer.py`, then `storage/sink.py` — each time, copying the now-validated ~20 lines was judged lower risk than refactoring an already-working, tested module mid-project. Extracted afterward, once all three had shipped and the pattern had stopped changing, into `shutdown.ShutdownHandler` (`shutdown.py`), now shared by all three. Re-verified live after the refactor: `SIGTERM` against a running `python -m storage` and `python -m streaming` both logged the shutdown message and exited cleanly, same as before.
 
 **A real `pytest` bug, not a Kafka one, while adding `storage/`'s tests.** `tests/storage/test_schema.py` and the pre-existing `tests/streaming/test_schema.py` share a basename, and neither test directory has an `__init__.py` — pytest's import system collided on the two, failing collection entirely. The first fix tried, adding `__init__.py` to the test directories, made it worse: `tests/ingestion/__init__.py` turned `tests/ingestion` into a package literally named `ingestion`, which then shadowed the real top-level `ingestion` package for every `from ingestion import ...` in that directory's own tests. Reverted, and fixed the narrower way instead: renamed the one genuinely colliding file (`tests/storage/test_schema.py` → `test_anomaly_schema.py`), leaving the working `tests/ingestion/` and `tests/streaming/` layouts untouched.
 
@@ -189,20 +189,22 @@ The connect-timeout watchdog (`CONNECT_TIMEOUT_SECONDS=20`) fired exactly as des
 
 ```
 streamalpha/
-├── ingestion/          # Alpaca WebSocket client, idempotent Kafka producer
-├── streaming/           # Consumer (manual offsets, DLQ), windowing, online ML, persistence
-├── storage/              # Idempotent Postgres sink: schema, upsert, manual-offset consumer
-├── analysis/              # Cross-reference detected anomalies against alpha-signal-lab's factors
-├── backend/               # read-only FastAPI layer: anomalies, status, live tick relay
-├── chaos/                  # burst, kill, and disconnect tests -- see Chaos Testing
-├── notebooks/               # empty -- research notebook not yet added
+├── ingestion/                  # Alpaca WebSocket client, idempotent Kafka producer
+├── streaming/                  # Consumer (manual offsets, DLQ), windowing, online ML, persistence
+├── storage/                    # Idempotent Postgres sink: schema, upsert, manual-offset consumer
+├── analysis/                   # Cross-reference detected anomalies against alpha-signal-lab's factors
+├── backend/                    # read-only FastAPI layer: anomalies, status, live tick relay
+├── chaos/                      # burst, kill, and disconnect tests -- see Chaos Testing
+├── notebooks/                  # empty -- research notebook not yet added
 ├── tests/
-│   ├── ingestion/             # producer, Alpaca stream wiring, reconnect/shutdown logic
-│   ├── streaming/               # schema, consumer, DLQ, aggregation, models, BOCPD, persistence
-│   ├── storage/                  # anomaly schema validation, upsert SQL, sink consumer logic
-│   ├── analysis/                   # factor z-score logic, anomaly-date matching, tz conversion
-│   └── backend/                      # kafka_admin lag/size math, /anomalies, /status, /ws/ticks
-├── docker-compose.yml            # local Kafka (KRaft mode) + Postgres, topic bootstrap
+│   ├── ingestion/              # producer, Alpaca stream wiring, reconnect/shutdown logic
+│   ├── streaming/              # schema, consumer, DLQ, aggregation, models, BOCPD, persistence
+│   ├── storage/                # anomaly schema validation, upsert SQL, sink consumer logic
+│   ├── analysis/               # factor z-score logic, anomaly-date matching, tz conversion
+│   ├── backend/                # kafka_admin lag/size math, /anomalies, /status, /ws/ticks
+│   └── test_shutdown.py        # ShutdownHandler, shared by ingestion/streaming/storage
+├── shutdown.py                 # shared SIGINT/SIGTERM -> flag handler (see Correctness Design)
+├── docker-compose.yml          # local Kafka (KRaft mode) + Postgres, topic bootstrap
 ├── requirements.txt
 └── .env.example
 ```
@@ -275,7 +277,8 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 - Per-ticker windowed volume/volatility aggregation, online volume-spike detection (`HalfSpaceTrees`) and volatility regime-change detection (from-scratch BOCPD), periodic model state persistence, and publishing to `volume-anomalies`/`regime-changes` — all verified live end-to-end, not just in unit tests: a real `RegimeChange` event was produced by the running consumer and confirmed in Kafka, and a restart was confirmed to resume from saved state rather than start cold. See [Online Anomaly Detection](#online-anomaly-detection) for what works reliably versus what's an honestly-documented limitation.
 - An idempotent Postgres sink (`storage/`) completing the exactly-once story end to end, verified live: synthetic anomaly events produced to Kafka landed correctly in a single `anomalies` table, and a forced full redelivery of the same messages (consumer group offsets reset to earliest, sink rerun) left the row count unchanged with the original `detected_at` preserved — real Kafka redelivery, not just a direct call to the upsert function.
 - A cross-reference analysis (`analysis/cross_reference.py`) against alpha-signal-lab's own factor computation, run for real against streamalpha's live-detected anomalies and alpha-signal-lab's factors over real price history — see [Cross-Reference Analysis](#cross-reference-analysis) for the actual output and why n=2 doesn't support a general conclusion yet.
-- 137 unit tests across ingestion, streaming, storage, analysis, and backend (offline, no live Kafka/Alpaca/Postgres/network required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, a `pytest` test-collection bug found while adding storage's tests (and found again, the same way, while adding `tests/backend/`), the empty-env-var-crashes-`group.id` bug, a `numpy.bool_ is True/False` identity-check bug, a wrong assumption about how much synthetic price history is actually insufficient for the rolling factor windows, and the `/ws/ticks` idle-disconnect leak.
+- 142 unit tests across ingestion, streaming, storage, analysis, backend, and the shared shutdown handler (offline, no live Kafka/Alpaca/Postgres/network required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, a `pytest` test-collection bug found while adding storage's tests (and found again, the same way, while adding `tests/backend/`), the empty-env-var-crashes-`group.id` bug, a `numpy.bool_ is True/False` identity-check bug, a wrong assumption about how much synthetic price history is actually insufficient for the rolling factor windows, and the `/ws/ticks` idle-disconnect leak.
+- The shutdown-signal-handling pattern (`shutdown.ShutdownHandler`), extracted into one shared, tested module after being copy-pasted identically into `ingestion/run.py`, `streaming/consumer.py`, and `storage/sink.py`. Re-verified live post-refactor: `SIGTERM` against a running `python -m storage` and `python -m streaming` both still log the shutdown message and exit cleanly.
 - Chaos testing (`chaos/`) against real infrastructure: a burst test (8,000-message synthetic load, peak lag and recovery time measured), a kill test (`SIGKILL` deterministically landed in the exact commit-vs-durable-write race window, confirming no ticks lost and no duplicate rows despite confirmed real redelivery), and a disconnect test (real `pfctl` network block of Alpaca's host, confirming the connect-timeout watchdog and backoff/retry loop actually fire and reconnect). Also directly responsible for finding and fixing a real bug outside its own scope: Kafka's `log.dirs` was never pointed at the mounted `kafka-data` volume, so no topic had ever actually been durable across a container recreation. See [Chaos Testing](#chaos-testing) for real numbers and logs.
 - A read-only FastAPI backend (`backend/`) over anomalies, pipeline health, and a live tick relay, verified live end-to-end against real Kafka/Postgres — including a real concurrency bug found and fixed by testing its disconnect path specifically (an idle WebSocket client leaking its handler and Kafka consumer forever, hanging `uvicorn` on shutdown). See [Backend](#backend) for what broke and how it was confirmed fixed.
 
@@ -286,7 +289,6 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 ## Future Work
 
 - Improve isolated-spike volume detection recall (see [Online Anomaly Detection](#online-anomaly-detection)) with richer features — recent volume trend, multiple lookback ratios — instead of raw windowed volume alone.
-- Extract the shutdown-signal-handling pattern, now duplicated three times (`ingestion/run.py`, `streaming/consumer.py`, `storage/sink.py`), into one shared, tested helper.
 - Revisit the cross-reference analysis once weeks of real anomalies have accumulated — n=2 is a working pipeline, not a result; a real finding (or honestly, a real absence of one) needs a much larger sample.
 - `/ws/ticks` leaves one stale consumer-group entry behind per past connection (see [Backend](#backend)) — fine at this project's current scale, but worth revisiting (shared broadcast instead of one Kafka consumer per connection) before supporting many concurrent dashboard users.
 - A frontend dashboard, managed Kafka + hosting for deployment, and a full write-up of results, limitations, and assumptions once there's something real to report.

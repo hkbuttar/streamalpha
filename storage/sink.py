@@ -13,26 +13,26 @@ storage/schema.py's module docstring for why a malformed payload on these
 topics is treated as a bug worth crashing on, not bad data worth routing
 aside.
 
-Shutdown signal handling deliberately duplicates streaming/consumer.py's
-pattern (custom signal.signal() handler plus a cooperatively-checked
-flag) rather than relying on KeyboardInterrupt, for the same reason
-documented there: confirmed via lldb, twice, in two unrelated C
+Shutdown signal handling uses shutdown.ShutdownHandler (custom
+signal.signal() handler plus a cooperatively-checked flag) rather than
+relying on KeyboardInterrupt, for the same reason documented in
+streaming/consumer.py: confirmed via lldb, twice, in two unrelated C
 extensions, that a blocking call with a timeout still can't be trusted to
-let a pending signal through promptly. This is copied rather than shared
-through a common helper -- duplicating an already-validated ~20 lines is
-lower risk right now than refactoring two working, tested modules to
-share one, though that refactor would be reasonable future cleanup.
+let a pending signal through promptly. Originally copy-pasted here and
+into ingestion/run.py rather than shared -- duplicating an
+already-validated ~20 lines was judged lower risk than refactoring three
+working, tested modules to share one, mid-project. Extracted once all
+three had shipped and the pattern had stopped changing.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import signal
-import threading
 
 from confluent_kafka import Consumer, KafkaError
 
+from shutdown import ShutdownHandler
 from storage.db import get_connection, upsert_anomaly
 from storage.schema import AnomalyValidationError, parse_anomaly_event
 
@@ -48,16 +48,7 @@ TOPIC_TO_ANOMALY_TYPE = {
     REGIME_CHANGES_TOPIC: "regime_change",
 }
 
-_shutdown = threading.Event()
-
-
-def _install_shutdown_handler() -> None:
-    def _on_signal(signum: int, _frame: object) -> None:
-        log.info("received signal %s, shutting down", signum)
-        _shutdown.set()
-
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
+_shutdown = ShutdownHandler()
 
 
 def run_sink(
@@ -67,7 +58,7 @@ def run_sink(
     topics: list[str] | None = None,
 ) -> None:
     _shutdown.clear()
-    _install_shutdown_handler()
+    _shutdown.install()
 
     topics = topics or [VOLUME_ANOMALIES_TOPIC, REGIME_CHANGES_TOPIC]
     bootstrap_servers = bootstrap_servers or os.environ["KAFKA_BOOTSTRAP_SERVERS"]

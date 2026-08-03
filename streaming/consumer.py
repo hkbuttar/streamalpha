@@ -33,19 +33,19 @@ blocking call (threading.Thread.join()), so it's treated as a general
 rule here rather than a one-off: don't rely on a blocking C call to
 surface a signal as a Python exception, even with a timeout. Instead, a
 custom signal.signal() handler sets a flag, checked cooperatively after
-each poll() returns.
+each poll() returns -- shutdown.ShutdownHandler, shared with
+storage/sink.py and ingestion/run.py, which all need the same pattern.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import signal
-import threading
 from collections.abc import Callable
 
 from confluent_kafka import Consumer, KafkaError
 
+from shutdown import ShutdownHandler
 from streaming.dlq import DLQProducer
 from streaming.schema import TickValidationError, parse_tick
 
@@ -57,16 +57,7 @@ POLL_TIMEOUT_SECONDS = 1.0
 
 ProcessTick = Callable[[dict], None]
 
-_shutdown = threading.Event()
-
-
-def _install_shutdown_handler() -> None:
-    def _on_signal(signum: int, _frame: object) -> None:
-        log.info("received signal %s, shutting down", signum)
-        _shutdown.set()
-
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
+_shutdown = ShutdownHandler()
 
 
 def run_consumer(
@@ -81,7 +72,7 @@ def run_consumer(
     Runs until a SIGINT/SIGTERM is received or process_tick raises.
     """
     _shutdown.clear()
-    _install_shutdown_handler()
+    _shutdown.install()
 
     topics = topics or [MARKET_TICKS_TOPIC]
     bootstrap_servers = bootstrap_servers or os.environ["KAFKA_BOOTSTRAP_SERVERS"]

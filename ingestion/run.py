@@ -49,9 +49,11 @@ for 7+ seconds without firing while polling thread.join(timeout=0.2) in a
 loop, even though the polling itself was running on schedule. A custom
 signal.signal() handler that just sets a threading.Event, checked
 cooperatively inside the same poll loop, fired within ~50ms in the same
-test. That is the pattern used below -- not the more obvious
-try/except KeyboardInterrupt one -- because it is the one actually verified
-to work, not the one that looked like it should.
+test. That is the pattern used below (shutdown.ShutdownHandler, shared
+with streaming/consumer.py and storage/sink.py, which hit the same
+problem independently) -- not the more obvious try/except
+KeyboardInterrupt one -- because it is the one actually verified to
+work, not the one that looked like it should.
 
 In-flight state during a gap. This process holds no state of its own across
 ticks -- each trade/quote is serialized and handed to the producer
@@ -66,7 +68,6 @@ from __future__ import annotations
 
 import logging
 import os
-import signal
 import threading
 import time
 
@@ -75,6 +76,7 @@ from dotenv import load_dotenv
 
 from ingestion.alpaca_stream import build_stream
 from ingestion.producer import TickProducer
+from shutdown import ShutdownHandler
 
 log = logging.getLogger(__name__)
 
@@ -84,16 +86,7 @@ CONNECT_TIMEOUT_SECONDS = 20
 POLL_INTERVAL_SECONDS = 0.2
 REQUIRED_ENV_VARS = ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "KAFKA_BOOTSTRAP_SERVERS")
 
-_shutdown = threading.Event()
-
-
-def _install_shutdown_handler() -> None:
-    def _on_signal(signum: int, _frame: object) -> None:
-        log.info("received signal %s, shutting down", signum)
-        _shutdown.set()
-
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
+_shutdown = ShutdownHandler()
 
 
 def _sleep_interruptible(seconds: float) -> None:
@@ -169,7 +162,7 @@ def _run_with_watchdog(
 def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    _install_shutdown_handler()
+    _shutdown.install()
 
     # Fail fast on missing configuration: a typo'd or unset env var is a
     # setup error, not a transient failure, so retrying with backoff would
