@@ -1,15 +1,12 @@
 """TickerModels tests.
 
-Volume anomaly detection is tested for "does it fire on an obvious spike
-well past warm-up, without firing constantly on quiet data" rather than
-"does it catch every injected spike" -- it doesn't, reliably, on
-adversarial synthetic sequences, and that's a real, understood
-characteristic documented in streaming/models.py's module docstring and
-README.md's Limitations, not a bug: HalfSpaceTrees needs to build up
-enough structure (its own window_size) before scoring is reliable, so
-early-life detection is noisier. Chasing 100% recall on synthetic data
-would mean overfitting the thresholds to one arbitrary random sequence
-rather than reflecting real behavior.
+Volume anomaly detection is now a rolling z-score on volume itself, not
+HalfSpaceTrees (see streaming/models.py's module docstring for why that
+changed and what was actually tried first). Unlike the old design, this
+one is swept across many seeds and asserted to catch *every* spike, not
+just "can work with a known-good seed" -- confirmed empirically
+(50/50 seeds on an isolated 100x spike, a 10x spike, and a sustained
+elevated period) before writing these tests, not assumed.
 """
 
 from __future__ import annotations
@@ -35,30 +32,53 @@ def _summary(i, volume, volatility, symbol="AAPL"):
     )
 
 
-def test_obvious_spike_is_detected_after_warmup():
-    """seed=4 specifically: swept 10 seeds against an isolated 100x volume
-    spike with this exact config and only 1-3/10 detected it (tried three
-    fixes -- reduced tree height, a volume-ratio feature instead of raw
-    volume, both empirically -- none meaningfully improved it). That's a
-    real, documented characteristic of single-feature HalfSpaceTrees on an
-    isolated single-window outlier (see models.py's module docstring and
-    README.md's Limitations), not something masked here: this test proves
-    detection *can* work with a known-good seed, it isn't a claim that it
-    reliably will on arbitrary data. test_quiet_stream_does_not_flood_with_anomalies
-    covers the false-positive side.
+def test_isolated_spike_is_reliably_detected_across_many_seeds():
+    """The old HalfSpaceTrees-based detector caught this on only 1-3/10
+    seeds; this rolling-z-score design caught it on 50/50 in the sweep
+    that picked DEFAULT_VOLUME_Z_THRESHOLD (see models.py's module
+    docstring). 20 seeds here, not 50 -- enough to be a real regression
+    guard without slowing the suite down for marginal extra confidence.
     """
-    random.seed(4)
-    models = TickerModels("AAPL")
-    volume_flags = []
+    misses = []
+    for seed in range(20):
+        random.seed(seed)
+        models = TickerModels("AAPL")
+        volume_flags = []
+        for i in range(700):
+            volume = 100_000.0 if i == 600 else random.gauss(1000, 100)
+            summary = _summary(i, volume, volatility=0.01)
+            for event in models.process_window(summary):
+                if isinstance(event, VolumeAnomaly):
+                    volume_flags.append(i)
+        if not any(abs(f - 600) <= 3 for f in volume_flags):
+            misses.append(seed)
 
-    for i in range(700):
-        volume = 100_000.0 if i == 600 else random.gauss(1000, 100)
-        summary = _summary(i, volume, volatility=0.01)
-        for event in models.process_window(summary):
-            if isinstance(event, VolumeAnomaly):
-                volume_flags.append(i)
+    assert misses == []
 
-    assert any(abs(f - 600) <= 3 for f in volume_flags)
+
+def test_sustained_elevated_volume_is_reliably_detected():
+    """A multi-window elevated-volume period (not just a single isolated
+    tick) -- the old detector also missed this reliably (1/10 seeds);
+    this one catches it every time in the same sweep.
+    """
+    misses = []
+    for seed in range(20):
+        random.seed(seed)
+        models = TickerModels("AAPL")
+        volume_flags = []
+        for i in range(800):
+            if 600 <= i < 630:
+                volume = random.gauss(8000, 800)
+            else:
+                volume = random.gauss(1000, 100)
+            summary = _summary(i, volume, volatility=0.01)
+            for event in models.process_window(summary):
+                if isinstance(event, VolumeAnomaly):
+                    volume_flags.append(i)
+        if not any(597 <= f <= 633 for f in volume_flags):
+            misses.append(seed)
+
+    assert misses == []
 
 
 def test_quiet_stream_does_not_flood_with_anomalies():
@@ -72,9 +92,10 @@ def test_quiet_stream_does_not_flood_with_anomalies():
             if isinstance(event, VolumeAnomaly):
                 volume_flags += 1
 
-    # Some noise is expected (this is a statistical threshold, not a hard
-    # rule), but it shouldn't be flagging a large fraction of quiet windows.
-    assert volume_flags < 25
+    # The z-score threshold was tuned for a mean of 0.04 false positives
+    # per 500 quiet windows across 50 seeds -- a handful, not zero, is
+    # still consistent with that; flooding is not.
+    assert volume_flags < 5
 
 
 def test_regime_change_detected_on_a_clear_volatility_shift():
