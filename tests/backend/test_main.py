@@ -34,9 +34,25 @@ class _FakeTickMessage:
 
 
 class _FakeTicksConsumer:
-    def __init__(self, config, messages):
+    """repeat=True keeps re-returning the same (last) message forever
+    instead of exhausting the list -- needed for the two-connection test
+    below, where a one-shot message races the second connection's
+    subscribe(): the relay loop's very first poll() can (and, empirically,
+    reliably does) deliver and exhaust a single one-shot message before
+    the second connection has even started its own setup, since the relay
+    task was already scheduled -- and therefore picked up by the event
+    loop scheduler -- before the second connection's cross-thread
+    portal.call() even has a chance to run. That's a race in what the
+    *test* feeds the consumer, not a limitation of concurrent WebSocket
+    connections themselves (see tick_broadcaster.py's module docstring
+    and README.md's Backend section for how this was actually confirmed,
+    not just asserted).
+    """
+
+    def __init__(self, config, messages, repeat=False):
         self.config = config
         self._messages = list(messages)
+        self._repeat = repeat
         self.subscribed = None
         self.closed = False
 
@@ -44,9 +60,9 @@ class _FakeTicksConsumer:
         self.subscribed = topics
 
     def poll(self, timeout):
-        if self._messages:
-            return self._messages.pop(0)
-        return None
+        if not self._messages:
+            return None
+        return self._messages[0] if self._repeat else self._messages.pop(0)
 
     def close(self):
         self.closed = True
@@ -151,8 +167,8 @@ def test_status_assembles_lag_dlq_and_model_freshness(monkeypatch):
     assert len(lag_calls) == 2
 
 
-def _wire_broadcaster(monkeypatch, messages):
-    fake_consumer = _FakeTicksConsumer(config=None, messages=messages)
+def _wire_broadcaster(monkeypatch, messages, repeat=False):
+    fake_consumer = _FakeTicksConsumer(config=None, messages=messages, repeat=repeat)
     monkeypatch.setattr(broadcaster_module, "Consumer", lambda config: fake_consumer)
     monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     broadcaster = TickBroadcaster()
@@ -173,6 +189,29 @@ def test_ws_ticks_relays_raw_payload_via_the_shared_broadcaster(monkeypatch):
 
     assert fake_consumer.subscribed == [broadcaster_module.MARKET_TICKS_TOPIC]
     assert broadcaster._subscribers == set()  # unsubscribed on disconnect
+
+
+def test_ws_ticks_two_connections_share_one_consumer_and_both_get_the_tick(monkeypatch):
+    """The whole point of this refactor: two simultaneous connections are
+    served by the same underlying Kafka consumer and both receive the
+    same relayed tick. repeat=True: with a one-shot message, the relay
+    loop's first poll() reliably delivers and exhausts it before the
+    second connection has even finished its own setup (see
+    _FakeTicksConsumer's docstring) -- not a bug in the endpoint, just not
+    how a real, continuously-producing topic behaves, so the fake
+    shouldn't behave that way either.
+    """
+    tick_bytes = b'{"type": "trade", "symbol": "AAPL"}'
+    _, broadcaster = _wire_broadcaster(
+        monkeypatch, messages=[_FakeTickMessage(tick_bytes)], repeat=True
+    )
+
+    client = TestClient(main_module.app)
+    with client.websocket_connect("/ws/ticks") as ws1, client.websocket_connect("/ws/ticks") as ws2:
+        assert ws1.receive_text() == tick_bytes.decode("utf-8")
+        assert ws2.receive_text() == tick_bytes.decode("utf-8")
+
+    assert broadcaster._subscribers == set()  # both unsubscribed on disconnect
 
 
 def test_ws_ticks_cleans_up_on_disconnect_even_with_no_messages_ever_sent(monkeypatch):
