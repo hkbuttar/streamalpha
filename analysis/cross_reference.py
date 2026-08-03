@@ -32,6 +32,7 @@ from datetime import date, timedelta
 import pandas as pd
 from config.universe import UNIVERSE
 from data.prices import load_prices
+from dotenv import load_dotenv
 from factors import mean_reversion, momentum, volatility
 
 from storage.db import get_connection
@@ -118,6 +119,7 @@ def cross_reference(
 
 
 def main() -> None:
+    load_dotenv()
     conn = get_connection()
     try:
         anomalies = load_anomalies(conn)

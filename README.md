@@ -2,7 +2,7 @@
 
 Real-time market anomaly detection via Kafka. Online/streaming ML (incremental isolation forest, Bayesian changepoint detection) flags volume spikes and volatility regime shifts, built around an explicit exactly-once processing story. Extends [alpha-signal-lab](https://github.com/hkbuttar/alpha-signal-lab)'s equity universe with a true event-streaming architecture in place of that project's daily batch loop.
 
-> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), the idempotent Postgres sink, and a cross-reference analysis against alpha-signal-lab's own factors are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is complete end to end. Backend, chaos testing, and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
+> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), the idempotent Postgres sink, a cross-reference analysis against alpha-signal-lab's own factors, and chaos testing (burst, kill, and disconnect tests against real infrastructure) are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is complete end to end and chaos-tested. Backend and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
 
 ---
 
@@ -13,10 +13,11 @@ Real-time market anomaly detection via Kafka. Online/streaming ML (incremental i
 4. [Correctness Design](#correctness-design)
 5. [Online Anomaly Detection](#online-anomaly-detection)
 6. [Cross-Reference Analysis](#cross-reference-analysis)
-7. [Repository Structure](#repository-structure)
-8. [Setup & Usage](#setup--usage)
-9. [Current Status](#current-status)
-10. [Future Work](#future-work)
+7. [Chaos Testing](#chaos-testing)
+8. [Repository Structure](#repository-structure)
+9. [Setup & Usage](#setup--usage)
+10. [Current Status](#current-status)
+11. [Future Work](#future-work)
 
 ---
 
@@ -132,6 +133,39 @@ Verified live end-to-end, not just in unit tests: a synthetic sustained volume/p
 
 ---
 
+## Chaos Testing
+
+The correctness claims in [Correctness Design](#correctness-design) — no ticks lost or duplicated across a crash, reconnect logic that actually reconnects — are design descriptions, not proof. `chaos/` exists to make them demonstrable: force the exact failure each design decision is supposed to survive, against real local Kafka/Postgres and a real Alpaca connection, and measure what actually happens rather than trust that it does.
+
+**Burst test (`chaos/burst_test.py`, `chaos/_burst_consumer.py`).** Publishes 8,000 synthetic ticks as fast as possible to an isolated topic (`chaos-burst-test`, not `market-ticks`, so this can't contaminate real anomaly data or trigger spurious detections), then runs a real `streaming.consumer.run_consumer()` consumer — in its own subprocess, not a thread, since `run_consumer`'s shutdown handler calls `signal.signal()`, which only works in a process's main thread — against it with a fixed 5ms simulated per-tick processing cost, and polls `kafka-consumer-groups.sh --describe` every second to track lag. Real result: 8,000 messages produced in 0.53s (~15,100 msg/s), peak consumer lag 7,948, drained back to 0 in 61.4s (~130 msg/s sustained consumption), with a clean signal-based shutdown afterward.
+
+**Kill test (`chaos/kill_test.py`, `chaos/_kill_test_consumer.py`).** The direct, demonstrable proof that the commit-after-durable-write discipline in `streaming/consumer.py` (see [Correctness Design](#correctness-design)) actually holds under a real crash, not just a description of how it's supposed to work. 300 known ticks (`trade_id` 0–299) are published to an isolated topic (`chaos-kill-test`), consumed by a subprocess whose `process_tick` durably upserts each into a dedicated Postgres table (`chaos_kill_test_ticks`, tracking an `attempts` counter per `trade_id`) *before* returning — which is what `run_consumer`'s offset commit is gated on. Catching the crash in the exact window that matters (write durable, Kafka offset not yet committed) isn't left to chance: for one designated `trade_id` (150), `process_tick` stalls 3 seconds after its Postgres commit but before returning, and the driver polls Postgres for that row and sends `SIGKILL` the moment it appears — deterministically landing the kill inside that window instead of hoping an externally-timed signal gets lucky. Real result:
+```
+At kill:      rows=151 distinct_trade_ids=151 max_attempts=1
+After restart: rows=300 distinct_trade_ids=300 max_attempts=2
+No ticks lost: True (300/300 distinct trade_ids present)
+No duplicate rows: True (row count == distinct trade_id count)
+Redelivery after crash actually occurred: True (max attempts=2)
+```
+`trade_id=150`'s `attempts=2` is direct evidence Kafka redelivered it after the restart (its offset was never committed) and the idempotent upsert absorbed the reprocessing without creating a duplicate row — both halves of the guarantee confirmed, not just the convenient half.
+
+**Disconnect test (`chaos/disconnect_test.sh`).** Blocks `stream.data.alpaca.markets` at the network layer via a temporary `pfctl` rule — real packet-level denial, not a code-level simulation — and confirms `ingestion/run.py`'s connect-timeout watchdog and backoff/retry loop actually fire and reconnect once the network is restored. The block is applied *before* ingestion's first connection attempt, not mid-stream: a drop on an already-open connection is caught and silently retried entirely inside alpaca-py's own internal loop without ever returning control to this project's code (see `ingestion/run.py`'s "Transient drops" docstring section), so it wouldn't exercise this project's own gap-logging/backoff code at all — and unlike waiting for live trade ticks, a failed-connect test doesn't depend on the market being open. The pf rule is scoped to exactly the resolved IP(s) for that one host, validated with `pfctl -nf` before ever being applied, and the entire prior pf ruleset is saved and restored via a `trap` on exit (including Ctrl+C), leaving pf disabled again afterward if it was disabled before the script ran. Real log, block applied at t=0s, lifted at t=30s:
+```
+14:18:29  connecting to wss://stream.data.alpaca.markets/v2/iex
+14:18:39  TimeoutError (attempt 1, blocked)
+14:18:49  no successful connection within 20s; forcing a stop instead of hot-looping
+14:18:59  stream never connected; tick gap starts now
+14:18:59  reconnecting in 1s
+14:19:00  connecting to wss://stream.data.alpaca.markets/v2/iex   <- block lifted at t=30s
+14:19:00  connected to wss://stream.data.alpaca.markets/v2/iex
+14:19:00  subscribed to trades: [...15 symbols...]
+```
+The connect-timeout watchdog (`CONNECT_TIMEOUT_SECONDS=20`) fired exactly as designed, the gap was logged rather than silently absorbed, and the very next retry succeeded within ~150ms of the block being lifted.
+
+**A real bug chaos testing found that none of the other three tests were looking for.** Mid-way through this work, the `streamalpha-kafka` and `streamalpha-postgres` containers were found stopped and removed (external to this project — some other process or command). Recreating them via `docker compose up -d` showed Postgres's data intact (its named volume worked correctly) but every Kafka topic gone, recreated empty by `kafka-init`. `docker-compose.yml` mounted a `kafka-data` volume at `/var/lib/kafka/data`, but Kafka's actual `log.dirs` was never pointed at that path and defaulted to `/tmp/kafka-logs` — inside the container's writable layer, not the mount. The volume declaration had been a silent no-op for the entire project: nothing Kafka ever wrote was actually durable across a container recreation, including real production `market-ticks` data, not just this session's chaos-test topics. Fixed by setting `KAFKA_LOG_DIRS: /var/lib/kafka/data` explicitly in `docker-compose.yml`, and verified live: produced a message, force-removed and recreated the container (`docker rm -f` + `docker compose up -d`), and confirmed both the topic and the message survived. Left in as a reminder that a chaos-testing session can surface real bugs outside the scope of whatever it set out to test.
+
+---
+
 ## Repository Structure
 
 ```
@@ -141,7 +175,7 @@ streamalpha/
 ├── storage/              # Idempotent Postgres sink: schema, upsert, manual-offset consumer
 ├── analysis/              # Cross-reference detected anomalies against alpha-signal-lab's factors
 ├── backend/               # empty -- FastAPI backend not yet built
-├── chaos/                  # empty -- load/fault-injection tests not yet built
+├── chaos/                  # burst, kill, and disconnect tests -- see Chaos Testing
 ├── notebooks/               # empty -- research notebook not yet added
 ├── tests/
 │   ├── ingestion/             # producer, Alpaca stream wiring, reconnect/shutdown logic
@@ -191,6 +225,11 @@ python -m analysis.cross_reference
 python -m streaming.dlq_tools inspect --limit 20
 python -m streaming.dlq_tools replay --limit 20
 
+# chaos tests -- see Chaos Testing for what each one does and real results
+python -m chaos.burst_test              # synthetic load burst, measures consumer lag/recovery
+python -m chaos.kill_test               # SIGKILLs a consumer mid-processing, verifies no loss/dupes
+./chaos/disconnect_test.sh              # requires sudo: real pfctl network block of Alpaca's host
+
 docker compose down
 ```
 
@@ -211,8 +250,9 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 - An idempotent Postgres sink (`storage/`) completing the exactly-once story end to end, verified live: synthetic anomaly events produced to Kafka landed correctly in a single `anomalies` table, and a forced full redelivery of the same messages (consumer group offsets reset to earliest, sink rerun) left the row count unchanged with the original `detected_at` preserved — real Kafka redelivery, not just a direct call to the upsert function.
 - A cross-reference analysis (`analysis/cross_reference.py`) against alpha-signal-lab's own factor computation, run for real against streamalpha's live-detected anomalies and alpha-signal-lab's factors over real price history — see [Cross-Reference Analysis](#cross-reference-analysis) for the actual output and why n=2 doesn't support a general conclusion yet.
 - 121 unit tests across ingestion, streaming, storage, and analysis (offline, no live Kafka/Alpaca/Postgres/network required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, a `pytest` test-collection bug found while adding storage's tests, the empty-env-var-crashes-`group.id` bug, and (while adding this step's tests) a `numpy.bool_ is True/False` identity-check bug and a wrong assumption about how much synthetic price history is actually insufficient for the rolling factor windows.
+- Chaos testing (`chaos/`) against real infrastructure: a burst test (8,000-message synthetic load, peak lag and recovery time measured), a kill test (`SIGKILL` deterministically landed in the exact commit-vs-durable-write race window, confirming no ticks lost and no duplicate rows despite confirmed real redelivery), and a disconnect test (real `pfctl` network block of Alpaca's host, confirming the connect-timeout watchdog and backoff/retry loop actually fire and reconnect). Also directly responsible for finding and fixing a real bug outside its own scope: Kafka's `log.dirs` was never pointed at the mounted `kafka-data` volume, so no topic had ever actually been durable across a container recreation. See [Chaos Testing](#chaos-testing) for real numbers and logs.
 
-**Not yet built:** the FastAPI backend, the chaos/load testing harness, the dashboard, and deployment.
+**Not yet built:** the FastAPI backend, the dashboard, and deployment.
 
 ---
 
@@ -222,5 +262,4 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 - Extract the shutdown-signal-handling pattern, now duplicated three times (`ingestion/run.py`, `streaming/consumer.py`, `storage/sink.py`), into one shared, tested helper.
 - Revisit the cross-reference analysis once weeks of real anomalies have accumulated — n=2 is a working pipeline, not a result; a real finding (or honestly, a real absence of one) needs a much larger sample.
 - FastAPI backend exposing live ticks, anomalies, and system health (consumer lag, DLQ depth, model freshness per ticker) — including query helpers for the `anomalies` table, which `storage/db.py` currently only writes to.
-- Chaos testing: burst load, a kill-and-restart test proving no ticks are lost or duplicated, and a WebSocket disconnect test.
 - A frontend dashboard, managed Kafka + hosting for deployment, and a full write-up of results, limitations, and assumptions once there's something real to report.

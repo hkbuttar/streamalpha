@@ -16,6 +16,12 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Without this, log.dirs defaults to /tmp/kafka-logs -- inside the
+      # container's writable layer, not the kafka-data volume below.
+      # Confirmed live: a container recreation with this unset silently
+      # lost every topic and message despite the volume mount existing and
+      # looking correct.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
