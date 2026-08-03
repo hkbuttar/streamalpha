@@ -114,6 +114,15 @@ class TickerModels:
             changepoint_probability_threshold=bocpd_threshold,
         )
 
+        # Tick-time (window_end), not wall-clock -- same convention as
+        # aggregation.py's windowing -- so this reflects "as of what point
+        # in the data was this ticker's model last fed a window," which is
+        # what backend/main.py's /status endpoint reports as per-ticker
+        # model freshness: a ticker whose value stops advancing is a real
+        # signal (it stopped trading, or its pipeline path broke), not
+        # just bookkeeping.
+        self.last_updated: datetime | None = None
+
     def process_window(self, summary: WindowSummary) -> list[VolumeAnomaly | RegimeChange]:
         events: list[VolumeAnomaly | RegimeChange] = []
 
@@ -126,6 +135,7 @@ class TickerModels:
             if regime_change is not None:
                 events.append(regime_change)
 
+        self.last_updated = summary.window_end
         return events
 
     def _check_volume(self, summary: WindowSummary) -> VolumeAnomaly | None:

@@ -10,15 +10,22 @@ from __future__ import annotations
 from psycopg.types.json import Json
 
 from storage import db as db_module
-from storage.db import get_connection, upsert_anomaly
+from storage.db import get_connection, list_anomalies, upsert_anomaly
 
 
 class _FakeCursor:
-    def __init__(self, executed: list) -> None:
+    def __init__(
+        self, executed: list, rows: list | None = None, columns: list | None = None
+    ) -> None:
         self._executed = executed
+        self._rows = rows or []
+        self.description = [_Col(c) for c in (columns or [])]
 
     def execute(self, sql, params=None) -> None:
         self._executed.append((sql, params))
+
+    def fetchall(self):
+        return self._rows
 
     def __enter__(self):
         return self
@@ -27,14 +34,21 @@ class _FakeCursor:
         return False
 
 
+class _Col:
+    def __init__(self, name):
+        self.name = name
+
+
 class _FakeConnection:
-    def __init__(self) -> None:
+    def __init__(self, rows: list | None = None, columns: list | None = None) -> None:
         self.executed: list = []
         self.commits = 0
         self.closed = False
+        self._rows = rows
+        self._columns = columns
 
     def cursor(self) -> _FakeCursor:
-        return _FakeCursor(self.executed)
+        return _FakeCursor(self.executed, self._rows, self._columns)
 
     def commit(self) -> None:
         self.commits += 1
@@ -91,3 +105,52 @@ def test_upsert_anomaly_executes_insert_with_correct_params_and_commits():
     assert json_details.obj == details
 
     assert fake.commits == 1
+
+
+_ANOMALY_COLUMNS = ["ticker", "window_start", "anomaly_type", "details", "detected_at"]
+
+
+def test_list_anomalies_with_no_filters():
+    rows = [
+        (
+            "AAPL",
+            "2024-01-02T15:30:00+00:00",
+            "volume_anomaly",
+            {"score": 0.9},
+            "2024-01-02T15:31:00+00:00",
+        )
+    ]
+    fake = _FakeConnection(rows=rows, columns=_ANOMALY_COLUMNS)
+
+    result = list_anomalies(fake)
+
+    [(sql, params)] = fake.executed
+    assert "SELECT ticker, window_start, anomaly_type, details, detected_at" in sql
+    assert "FROM anomalies" in sql
+    assert "WHERE" not in sql
+    assert "ORDER BY detected_at DESC" in sql
+    assert params == [50]
+    assert result == [
+        {
+            "ticker": "AAPL",
+            "window_start": "2024-01-02T15:30:00+00:00",
+            "anomaly_type": "volume_anomaly",
+            "details": {"score": 0.9},
+            "detected_at": "2024-01-02T15:31:00+00:00",
+        }
+    ]
+
+
+def test_list_anomalies_filters_by_ticker_and_anomaly_type():
+    fake = _FakeConnection(rows=[], columns=_ANOMALY_COLUMNS)
+
+    list_anomalies(fake, ticker="AAPL", anomaly_type="regime_change", limit=10)
+
+    [(sql, params)] = fake.executed
+    assert "WHERE ticker = %s AND anomaly_type = %s" in sql
+    assert params == ["AAPL", "regime_change", 10]
+
+
+def test_list_anomalies_empty_table_returns_empty_list():
+    fake = _FakeConnection(rows=[], columns=_ANOMALY_COLUMNS)
+    assert list_anomalies(fake) == []

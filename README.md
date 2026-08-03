@@ -2,7 +2,7 @@
 
 Real-time market anomaly detection via Kafka. Online/streaming ML (incremental isolation forest, Bayesian changepoint detection) flags volume spikes and volatility regime shifts, built around an explicit exactly-once processing story. Extends [alpha-signal-lab](https://github.com/hkbuttar/alpha-signal-lab)'s equity universe with a true event-streaming architecture in place of that project's daily batch loop.
 
-> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), the idempotent Postgres sink, a cross-reference analysis against alpha-signal-lab's own factors, and chaos testing (burst, kill, and disconnect tests against real infrastructure) are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is complete end to end and chaos-tested. Backend and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
+> **Status**: In progress. Ingestion, consumer correctness (manual offsets, DLQ routing and replay), online anomaly detection (volume spikes, volatility regime changes), the idempotent Postgres sink, a cross-reference analysis against alpha-signal-lab's own factors, chaos testing (burst, kill, and disconnect tests against real infrastructure), and a read-only FastAPI backend are built and verified against a live Alpaca paper account, a local Kafka broker, and a local Postgres. The exactly-once story (idempotent producer → manual offset commit → idempotent sink) is complete end to end and chaos-tested. A frontend dashboard and deployment are not yet built — see [Current Status](#current-status) for what's real versus what's planned.
 
 ---
 
@@ -14,10 +14,11 @@ Real-time market anomaly detection via Kafka. Online/streaming ML (incremental i
 5. [Online Anomaly Detection](#online-anomaly-detection)
 6. [Cross-Reference Analysis](#cross-reference-analysis)
 7. [Chaos Testing](#chaos-testing)
-8. [Repository Structure](#repository-structure)
-9. [Setup & Usage](#setup--usage)
-10. [Current Status](#current-status)
-11. [Future Work](#future-work)
+8. [Backend](#backend)
+9. [Repository Structure](#repository-structure)
+10. [Setup & Usage](#setup--usage)
+11. [Current Status](#current-status)
+12. [Future Work](#future-work)
 
 ---
 
@@ -43,7 +44,9 @@ flowchart LR
     T3 --> SK[Manual-offset sink<br/>storage/sink.py]
     SK -->|idempotent upsert| S[(Postgres: anomalies)]
 
-    S -.not yet built.-> B[FastAPI backend]
+    S -->|read-only queries| B[FastAPI backend<br/>backend/main.py]
+    T1 -->|live relay| B
+    B -.not yet built.-> F[Frontend dashboard]
 ```
 
 Solid boxes and arrows are built and verified; dashed ones are planned (see [Current Status](#current-status)). Every stage that exists is a separate module so ingestion, consumption, and (eventually) modeling can be tested and reasoned about independently.
@@ -166,6 +169,22 @@ The connect-timeout watchdog (`CONNECT_TIMEOUT_SECONDS=20`) fired exactly as des
 
 ---
 
+## Backend
+
+`backend/main.py` is a read-only FastAPI layer over what the rest of the pipeline already produces: it writes nothing and every other process (ingestion, streaming, storage) runs completely unaffected by whether it's even started.
+
+- **`GET /anomalies`** — the most recent rows from Postgres (`storage/db.py`'s `list_anomalies`, added here since that module was write-only until now), optionally filtered by `ticker` and/or `anomaly_type`.
+- **`GET /status`** — Kafka consumer lag for both the streaming consumer and the storage sink, `market-ticks-dlq`'s current depth, and per-ticker model freshness. Consumer lag and topic size are computed directly via `confluent_kafka`'s `AdminClient`/`Consumer` APIs (`backend/kafka_admin.py`), not by shelling out to `kafka-consumer-groups.sh` the way `chaos/`'s one-off diagnostic scripts do — a real endpoint needs to work against any broker, not just a local container with the CLI tools installed inside it. A partition with no committed offset yet is reported as lagging from the earliest retained message, not as zero — that matches `auto.offset.reset: "earliest"`, which every consumer in this project actually uses, so the number reflects the real backlog a fresh consumer would face rather than a falsely reassuring zero.
+- **`WS /ws/ticks`** — relays raw `market-ticks` payloads to the client in real time, via a fresh per-connection consumer group reading from `"latest"`.
+
+**Per-ticker model freshness required a small change outside `backend/`.** `streaming/model_state.py`'s pickle held model objects with no timestamp of their own, so "freshness" wasn't answerable without it. `streaming/models.py`'s `TickerModels` now tracks `last_updated`, set to each processed window's `window_end` (tick time, matching `streaming/aggregation.py`'s windowing convention, not wall-clock) — so a ticker whose value stops advancing is a real signal (it stopped trading, or its pipeline path broke), not just bookkeeping. Old pickled state predating this field is read with `getattr(model, "last_updated", None)` rather than a `model_state.py` format migration; confirmed live against the actual pre-existing `model_state.pkl` from this session, which correctly reported `null` freshness for every ticker instead of an `AttributeError`.
+
+**A real concurrency bug, found by testing the disconnect path specifically, not just the happy path.** The first version of `/ws/ticks` only discovered a client had disconnected inside its `except WebSocketDisconnect` around `send_text()` — which meant a client that disconnected while *idle* (no new ticks to relay) was never noticed at all: the loop just kept polling Kafka and sleeping, never attempting a send, leaking the connection and its Kafka consumer forever. Confirmed live: after one such idle-disconnect test, `SIGTERM` to the running `uvicorn` process hung indefinitely on "Waiting for background tasks to complete" instead of exiting. Fixed by running disconnect detection as its own concurrent task (`await websocket.receive()`, racing it against the Kafka-relay loop via `asyncio.wait(..., return_when=FIRST_COMPLETED)`) instead of piggybacking on a send that might not happen for a while. Re-verified live afterward: the same idle-disconnect sequence now lets `uvicorn` shut down immediately and cleanly.
+
+**A Kafka timing gotcha, also found live.** A fresh `"latest"`-offset consumer group needs a few seconds after `subscribe()` to complete its initial rebalance before `"latest"` is actually pinned; a tick produced immediately after a client connects can land in that window and never be seen. Confirmed directly: a test that produced a tick 2 seconds after connecting missed it, and the same test with a 6-second warm-up reliably received it. Not fixed (there's nothing to fix — this is inherent to how consumer groups join), just documented so it isn't mistaken for a relay bug if a dashboard built against this later seems to occasionally miss the very first tick after connecting.
+
+---
+
 ## Repository Structure
 
 ```
@@ -174,14 +193,15 @@ streamalpha/
 ├── streaming/           # Consumer (manual offsets, DLQ), windowing, online ML, persistence
 ├── storage/              # Idempotent Postgres sink: schema, upsert, manual-offset consumer
 ├── analysis/              # Cross-reference detected anomalies against alpha-signal-lab's factors
-├── backend/               # empty -- FastAPI backend not yet built
+├── backend/               # read-only FastAPI layer: anomalies, status, live tick relay
 ├── chaos/                  # burst, kill, and disconnect tests -- see Chaos Testing
 ├── notebooks/               # empty -- research notebook not yet added
 ├── tests/
 │   ├── ingestion/             # producer, Alpaca stream wiring, reconnect/shutdown logic
 │   ├── streaming/               # schema, consumer, DLQ, aggregation, models, BOCPD, persistence
 │   ├── storage/                  # anomaly schema validation, upsert SQL, sink consumer logic
-│   └── analysis/                   # factor z-score logic, anomaly-date matching, tz conversion
+│   ├── analysis/                   # factor z-score logic, anomaly-date matching, tz conversion
+│   └── backend/                      # kafka_admin lag/size math, /anomalies, /status, /ws/ticks
 ├── docker-compose.yml            # local Kafka (KRaft mode) + Postgres, topic bootstrap
 ├── requirements.txt
 └── .env.example
@@ -221,6 +241,12 @@ python -m storage
 # cross-reference detected anomalies against alpha-signal-lab's factors
 python -m analysis.cross_reference
 
+# backend: read-only API over anomalies/status, plus a live tick WebSocket
+# (separate terminal, Ctrl+C to stop cleanly)
+uvicorn backend.main:app --reload
+curl http://127.0.0.1:8000/anomalies
+curl http://127.0.0.1:8000/status
+
 # inspect or replay DLQ'd messages after fixing whatever caused them
 python -m streaming.dlq_tools inspect --limit 20
 python -m streaming.dlq_tools replay --limit 20
@@ -249,10 +275,11 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 - Per-ticker windowed volume/volatility aggregation, online volume-spike detection (`HalfSpaceTrees`) and volatility regime-change detection (from-scratch BOCPD), periodic model state persistence, and publishing to `volume-anomalies`/`regime-changes` — all verified live end-to-end, not just in unit tests: a real `RegimeChange` event was produced by the running consumer and confirmed in Kafka, and a restart was confirmed to resume from saved state rather than start cold. See [Online Anomaly Detection](#online-anomaly-detection) for what works reliably versus what's an honestly-documented limitation.
 - An idempotent Postgres sink (`storage/`) completing the exactly-once story end to end, verified live: synthetic anomaly events produced to Kafka landed correctly in a single `anomalies` table, and a forced full redelivery of the same messages (consumer group offsets reset to earliest, sink rerun) left the row count unchanged with the original `detected_at` preserved — real Kafka redelivery, not just a direct call to the upsert function.
 - A cross-reference analysis (`analysis/cross_reference.py`) against alpha-signal-lab's own factor computation, run for real against streamalpha's live-detected anomalies and alpha-signal-lab's factors over real price history — see [Cross-Reference Analysis](#cross-reference-analysis) for the actual output and why n=2 doesn't support a general conclusion yet.
-- 121 unit tests across ingestion, streaming, storage, and analysis (offline, no live Kafka/Alpaca/Postgres/network required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, a `pytest` test-collection bug found while adding storage's tests, the empty-env-var-crashes-`group.id` bug, and (while adding this step's tests) a `numpy.bool_ is True/False` identity-check bug and a wrong assumption about how much synthetic price history is actually insufficient for the rolling factor windows.
+- 137 unit tests across ingestion, streaming, storage, analysis, and backend (offline, no live Kafka/Alpaca/Postgres/network required to run), including regression coverage for the shutdown-signal bug class specifically because it looked fixed more than once before it actually was, the BOCPD signal-selection bug found while building it, a `pytest` test-collection bug found while adding storage's tests (and found again, the same way, while adding `tests/backend/`), the empty-env-var-crashes-`group.id` bug, a `numpy.bool_ is True/False` identity-check bug, a wrong assumption about how much synthetic price history is actually insufficient for the rolling factor windows, and the `/ws/ticks` idle-disconnect leak.
 - Chaos testing (`chaos/`) against real infrastructure: a burst test (8,000-message synthetic load, peak lag and recovery time measured), a kill test (`SIGKILL` deterministically landed in the exact commit-vs-durable-write race window, confirming no ticks lost and no duplicate rows despite confirmed real redelivery), and a disconnect test (real `pfctl` network block of Alpaca's host, confirming the connect-timeout watchdog and backoff/retry loop actually fire and reconnect). Also directly responsible for finding and fixing a real bug outside its own scope: Kafka's `log.dirs` was never pointed at the mounted `kafka-data` volume, so no topic had ever actually been durable across a container recreation. See [Chaos Testing](#chaos-testing) for real numbers and logs.
+- A read-only FastAPI backend (`backend/`) over anomalies, pipeline health, and a live tick relay, verified live end-to-end against real Kafka/Postgres — including a real concurrency bug found and fixed by testing its disconnect path specifically (an idle WebSocket client leaking its handler and Kafka consumer forever, hanging `uvicorn` on shutdown). See [Backend](#backend) for what broke and how it was confirmed fixed.
 
-**Not yet built:** the FastAPI backend, the dashboard, and deployment.
+**Not yet built:** the frontend dashboard and deployment.
 
 ---
 
@@ -261,5 +288,5 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 - Improve isolated-spike volume detection recall (see [Online Anomaly Detection](#online-anomaly-detection)) with richer features — recent volume trend, multiple lookback ratios — instead of raw windowed volume alone.
 - Extract the shutdown-signal-handling pattern, now duplicated three times (`ingestion/run.py`, `streaming/consumer.py`, `storage/sink.py`), into one shared, tested helper.
 - Revisit the cross-reference analysis once weeks of real anomalies have accumulated — n=2 is a working pipeline, not a result; a real finding (or honestly, a real absence of one) needs a much larger sample.
-- FastAPI backend exposing live ticks, anomalies, and system health (consumer lag, DLQ depth, model freshness per ticker) — including query helpers for the `anomalies` table, which `storage/db.py` currently only writes to.
+- `/ws/ticks` leaves one stale consumer-group entry behind per past connection (see [Backend](#backend)) — fine at this project's current scale, but worth revisiting (shared broadcast instead of one Kafka consumer per connection) before supporting many concurrent dashboard users.
 - A frontend dashboard, managed Kafka + hosting for deployment, and a full write-up of results, limitations, and assumptions once there's something real to report.

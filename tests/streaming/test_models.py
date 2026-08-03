@@ -115,6 +115,19 @@ def test_window_with_no_volatility_is_skipped_without_crashing():
     assert all(not isinstance(e, RegimeChange) for e in events)
 
 
+def test_last_updated_tracks_window_end_not_wall_clock():
+    models = TickerModels("AAPL")
+    assert models.last_updated is None
+
+    summary = _summary(0, volume=1000.0, volatility=0.01)
+    models.process_window(summary)
+    assert models.last_updated == summary.window_end
+
+    later_summary = _summary(5, volume=1000.0, volatility=0.01)
+    models.process_window(later_summary)
+    assert models.last_updated == later_summary.window_end
+
+
 def test_events_carry_the_correct_symbol():
     models = TickerModels("MSFT")
     random.seed(0)

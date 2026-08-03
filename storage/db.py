@@ -69,3 +69,42 @@ def upsert_anomaly(
             (ticker, window_start, anomaly_type, Json(details)),
         )
     conn.commit()
+
+
+def list_anomalies(
+    conn: psycopg.Connection,
+    ticker: str | None = None,
+    anomaly_type: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Most recent anomalies, newest first, optionally filtered by ticker
+    and/or anomaly_type. Read path for backend/main.py's /anomalies
+    endpoint -- this module was write-only (upsert_anomaly) until now.
+
+    ticker/anomaly_type are always passed as bind parameters, never
+    interpolated into the SQL string -- only the WHERE clause's shape
+    (which conditions are present) is built from them, not their values.
+    """
+    conditions = []
+    params: list = []
+    if ticker is not None:
+        conditions.append("ticker = %s")
+        params.append(ticker)
+    if anomaly_type is not None:
+        conditions.append("anomaly_type = %s")
+        params.append(anomaly_type)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""SELECT ticker, window_start, anomaly_type, details, detected_at
+                FROM anomalies
+                {where}
+                ORDER BY detected_at DESC
+                LIMIT %s""",
+            params,
+        )
+        rows = cur.fetchall()
+        columns = [col.name for col in cur.description]
+    return [dict(zip(columns, row, strict=True)) for row in rows]
