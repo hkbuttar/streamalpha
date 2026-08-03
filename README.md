@@ -201,7 +201,7 @@ streamalpha/
 ├── analysis/                   # Cross-reference detected anomalies against alpha-signal-lab's factors
 ├── backend/                    # read-only FastAPI layer: anomalies, status, live tick relay
 ├── chaos/                      # burst, kill, and disconnect tests -- see Chaos Testing
-├── notebooks/                  # empty -- research notebook not yet added
+├── notebooks/                  # research.ipynb: detector behavior + cross-reference, executed
 ├── tests/
 │   ├── ingestion/              # producer, Alpaca stream wiring, reconnect/shutdown logic
 │   ├── streaming/              # schema, consumer, DLQ, aggregation, models, BOCPD, persistence
@@ -264,6 +264,9 @@ python -m chaos.burst_test              # synthetic load burst, measures consume
 python -m chaos.kill_test               # SIGKILLs a consumer mid-processing, verifies no loss/dupes
 ./chaos/disconnect_test.sh              # requires sudo: real pfctl network block of Alpaca's host
 
+# research notebook: real anomalies, detector-behavior plots, cross-reference rerun
+jupyter lab notebooks/research.ipynb
+
 docker compose down
 ```
 
@@ -287,6 +290,7 @@ Optional env vars (see `.env.example`): `ANOMALY_WINDOW_SECONDS` (tumbling windo
 - The shutdown-signal-handling pattern (`shutdown.ShutdownHandler`), extracted into one shared, tested module after being copy-pasted identically into `ingestion/run.py`, `streaming/consumer.py`, and `storage/sink.py`. Re-verified live post-refactor: `SIGTERM` against a running `python -m storage` and `python -m streaming` both still log the shutdown message and exit cleanly.
 - Chaos testing (`chaos/`) against real infrastructure: a burst test (8,000-message synthetic load, peak lag and recovery time measured), a kill test (`SIGKILL` deterministically landed in the exact commit-vs-durable-write race window, confirming no ticks lost and no duplicate rows despite confirmed real redelivery), and a disconnect test (real `pfctl` network block of Alpaca's host, confirming the connect-timeout watchdog and backoff/retry loop actually fire and reconnect). Also directly responsible for finding and fixing a real bug outside its own scope: Kafka's `log.dirs` was never pointed at the mounted `kafka-data` volume, so no topic had ever actually been durable across a container recreation. See [Chaos Testing](#chaos-testing) for real numbers and logs.
 - A read-only FastAPI backend (`backend/`) over anomalies, pipeline health, and a live tick relay, verified live end-to-end against real Kafka/Postgres — including a real concurrency bug found and fixed by testing its disconnect path specifically (an idle WebSocket client leaking its handler and Kafka consumer forever, hanging `uvicorn` on shutdown). See [Backend](#backend) for what broke and how it was confirmed fixed.
+- `notebooks/research.ipynb`, an executed (not template) notebook with real outputs: the real anomalies table as currently stored, a visualization of the volume detector's behavior on a synthetic isolated spike, a visualization of BOCPD's changepoint-probability dynamics on a synthetic volatility shift, and a live rerun of the cross-reference analysis.
 
 **Not yet built:** the frontend dashboard and deployment.
 
