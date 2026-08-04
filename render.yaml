@@ -93,6 +93,13 @@ services:
     # alpha-signal-lab at all; see the note on streamalpha-backend above.
     buildCommand: pip install -r requirements-base.txt
     startCommand: python -m streaming
+    # Persists model_state.pkl across deploys/restarts -- without this, a
+    # Render worker's local disk is wiped on every deploy and every
+    # ticker's model starts cold. See README.md's Deployment section.
+    disk:
+      name: streamalpha-streaming-state
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: KAFKA_BOOTSTRAP_SERVERS
         sync: false
@@ -109,10 +116,7 @@ services:
       - key: ANOMALY_WINDOW_SECONDS
         sync: false
       - key: MODEL_STATE_PATH
-        sync: false # a Render worker's local disk isn't persistent across
-        # deploys/restarts by default -- model_state.pkl will start cold
-        # on every deploy unless a Render Disk is attached. Documented as
-        # a known gap in README.md's Deployment section, not solved here.
+        value: /var/data/model_state.pkl
       - key: PYTHON_VERSION
         value: 3.11.9
 
