@@ -13,14 +13,20 @@ services:
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: streamalpha-db
-          # externalConnectionString, not connectionString: the internal
-          # URL only routes if this service and streamalpha-db are in the
-          # same Render region, which they weren't -- confirmed live via a
-          # psycopg.errors.ConnectionTimeout on streamalpha-storage, while
-          # the external URL connects in under a second from anywhere.
-          property: externalConnectionString
+        # Not fromDatabase -- confirmed live (Render Shell, raw socket
+        # connect) that streamalpha-db's *internal* hostname
+        # (dpg-xxxx-a, no domain suffix) genuinely times out from this
+        # service's own network, even though both are in Oregon and
+        # Access Control is wide open; property: externalConnectionString
+        # was tried first to route around that, but Render silently kept
+        # injecting the internal one anyway -- that Blueprint property
+        # doesn't do what its name implies, at least not reliably. The
+        # external hostname (...oregon-postgres.render.com) connects
+        # instantly both from outside Render and from this service's own
+        # Shell, so it's hardcoded here as a plain secret instead: set
+        # this to streamalpha-db's *External Database URL*, copied
+        # directly from its Render dashboard page.
+        sync: false
       - key: KAFKA_BOOTSTRAP_SERVERS
         sync: false # managed Kafka provider's bootstrap servers -- see README.md's Deployment section
       - key: KAFKA_SECURITY_PROTOCOL
@@ -136,11 +142,9 @@ services:
     startCommand: python -m storage
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: streamalpha-db
-          # externalConnectionString -- see the note on streamalpha-backend
-          # above for why the internal connectionString times out here.
-          property: externalConnectionString
+        # Not fromDatabase -- see the note on streamalpha-backend above.
+        # Set to streamalpha-db's External Database URL.
+        sync: false
       - key: KAFKA_BOOTSTRAP_SERVERS
         sync: false
       - key: KAFKA_SECURITY_PROTOCOL
