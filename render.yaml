@@ -35,15 +35,17 @@ services:
   # consumer/producer loops (streaming/consumer.py's poll loop,
   # ingestion/run.py's WebSocket connection), not request/response HTTP
   # servers, so they don't bind $PORT the way streamalpha-backend does.
-  # `type: worker` is what Render calls this. Whether Render's free plan
-  # currently allows worker services (as opposed to just free web
-  # services) isn't something to assert with confidence here -- check
-  # Render's current pricing before assuming `plan: free` works for these
-  # three; `plan: starter` (paid) is the fallback if it doesn't.
+  # `type: worker` is what Render calls this. Confirmed live: Render's
+  # free (Hobby) plan does not support `type: worker` at all -- a
+  # Blueprint sync attempted on `plan: free` failed outright with
+  # "service type is not available for this plan" for all three, not a
+  # resource/quota limit. `plan: starter` (paid, confirm current price on
+  # Render's own service-creation screen before committing to it) is
+  # required, not just a fallback.
   - type: worker
     name: streamalpha-ingestion
     runtime: python
-    plan: free
+    plan: starter
     rootDir: .
     # The one Render service that actually needs alpha-signal-lab
     # (ingestion/alpaca_stream.py imports config.universe.UNIVERSE) --
@@ -85,7 +87,7 @@ services:
   - type: worker
     name: streamalpha-streaming
     runtime: python
-    plan: free
+    plan: starter
     rootDir: .
     # requirements-base.txt -- streaming/ doesn't import from
     # alpha-signal-lab at all; see the note on streamalpha-backend above.
@@ -117,7 +119,7 @@ services:
   - type: worker
     name: streamalpha-storage
     runtime: python
-    plan: free
+    plan: starter
     rootDir: .
     # requirements-base.txt -- storage/ doesn't import from
     # alpha-signal-lab at all; see the note on streamalpha-backend above.
