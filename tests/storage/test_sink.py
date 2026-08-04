@@ -117,7 +117,9 @@ def _wire(monkeypatch, queue):
         sink_module, "Consumer", lambda config: _set_config(fake_consumer, config)
     )
     fake_conn = _FakeConnection()
-    monkeypatch.setattr(sink_module, "get_connection", lambda database_url=None: fake_conn)
+    monkeypatch.setattr(
+        sink_module, "get_connection", lambda database_url=None, retries=1: fake_conn
+    )
 
     upserts = []
     monkeypatch.setattr(

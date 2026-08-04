@@ -34,7 +34,7 @@ from confluent_kafka import Consumer, KafkaError
 
 from kafka_config import kafka_client_config
 from shutdown import ShutdownHandler
-from storage.db import get_connection, upsert_anomaly
+from storage.db import CONNECT_RETRIES, get_connection, upsert_anomaly
 from storage.schema import AnomalyValidationError, parse_anomaly_event
 
 log = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ def run_sink(
             "auto.offset.reset": "earliest",
         }
     )
-    conn = get_connection(database_url)
+    conn = get_connection(database_url, retries=CONNECT_RETRIES)
     consumer.subscribe(topics)
 
     try:

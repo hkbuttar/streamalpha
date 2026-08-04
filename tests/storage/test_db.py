@@ -100,7 +100,7 @@ def test_get_connection_retries_on_operational_error_then_succeeds(monkeypatch):
     monkeypatch.setattr(db_module.psycopg, "connect", _fake_connect)
     monkeypatch.setattr(db_module.time, "sleep", lambda seconds: None)
 
-    conn = get_connection(database_url="postgresql://example/db")
+    conn = get_connection(database_url="postgresql://example/db", retries=5)
 
     assert conn is fake
     assert len(attempts) == 3
@@ -114,7 +114,32 @@ def test_get_connection_raises_after_exhausting_retries(monkeypatch):
     monkeypatch.setattr(db_module.time, "sleep", lambda seconds: None)
 
     with pytest.raises(db_module.psycopg.OperationalError):
+        get_connection(database_url="postgresql://example/db", retries=5)
+
+
+def test_get_connection_default_does_not_retry(monkeypatch):
+    """backend/main.py's /anomalies route calls get_connection() with no
+    retries argument on every request -- confirmed live that retrying with
+    a blocking time.sleep() there exhausts FastAPI's sync-route thread
+    pool under concurrent requests, taking down every route (even
+    zero-I/O ones like /health), not just /anomalies. The default must
+    fail fast.
+    """
+    attempts = []
+
+    def _fake_connect(database_url):
+        attempts.append(database_url)
+        raise db_module.psycopg.OperationalError("connection timeout expired")
+
+    monkeypatch.setattr(db_module.psycopg, "connect", _fake_connect)
+    slept = []
+    monkeypatch.setattr(db_module.time, "sleep", lambda seconds: slept.append(seconds))
+
+    with pytest.raises(db_module.psycopg.OperationalError):
         get_connection(database_url="postgresql://example/db")
+
+    assert len(attempts) == 1
+    assert slept == []
 
 
 def test_upsert_anomaly_executes_insert_with_correct_params_and_commits():

@@ -46,32 +46,38 @@ CONNECT_RETRIES = 5
 CONNECT_RETRY_DELAY_SECONDS = 3
 
 
-def get_connection(database_url: str | None = None) -> psycopg.Connection:
+def get_connection(database_url: str | None = None, retries: int = 1) -> psycopg.Connection:
     """Connect using DATABASE_URL (or the given override) and ensure the
     schema exists.
 
-    Retries on connect failure -- confirmed live on Render: storage/sink.py
-    calls this at process startup, immediately after constructing the Kafka
-    consumer, and consistently hit psycopg.errors.ConnectionTimeout there
-    while the identical DATABASE_URL worked fine moments later from
-    backend/main.py (which only connects lazily, per-request, well after
-    the container has been running a while) -- a container's outbound
+    retries defaults to 1 (no retry, fail fast) -- this is called from two
+    very different places. storage/sink.py calls it once, at process
+    startup, immediately after constructing the Kafka consumer, and
+    consistently hit psycopg.errors.ConnectionTimeout there while the
+    identical DATABASE_URL worked fine moments later from
+    backend/main.py's /anomalies route -- a container's outbound
     networking isn't necessarily ready in the first instant its process
-    starts. backend's per-request calls don't hit this window, so they
-    don't need the retry, but it's harmless there too.
+    starts, so that one-shot startup call passes retries=CONNECT_RETRIES.
+    backend's route is a sync `def`, which FastAPI runs on a small shared
+    thread pool, once per request -- retrying there with a *blocking*
+    time.sleep() confirmed live to take the whole backend down, not just
+    that route: enough concurrent /anomalies requests each sleeping for up
+    to CONNECT_RETRIES * CONNECT_RETRY_DELAY_SECONDS exhausted the thread
+    pool, so even /health (no I/O at all) started hanging, queued behind
+    threads stuck in sleep(). The request path needs to fail fast instead.
     """
     database_url = database_url or os.environ["DATABASE_URL"]
-    for attempt in range(1, CONNECT_RETRIES + 1):
+    for attempt in range(1, retries + 1):
         try:
             conn = psycopg.connect(database_url)
             break
         except psycopg.OperationalError:
-            if attempt == CONNECT_RETRIES:
+            if attempt == retries:
                 raise
             log.warning(
                 "Postgres connection attempt %d/%d failed, retrying in %ds",
                 attempt,
-                CONNECT_RETRIES,
+                retries,
                 CONNECT_RETRY_DELAY_SECONDS,
             )
             time.sleep(CONNECT_RETRY_DELAY_SECONDS)
