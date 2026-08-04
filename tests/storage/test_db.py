@@ -7,6 +7,7 @@ Correctness Design for that verification.
 
 from __future__ import annotations
 
+import pytest
 from psycopg.types.json import Json
 
 from storage import db as db_module
@@ -84,6 +85,36 @@ def test_get_connection_creates_schema_and_commits(monkeypatch):
     assert "CREATE TABLE IF NOT EXISTS anomalies" in sql
     assert params is None
     assert fake.commits == 1
+
+
+def test_get_connection_retries_on_operational_error_then_succeeds(monkeypatch):
+    fake = _FakeConnection()
+    attempts = []
+
+    def _fake_connect(database_url):
+        attempts.append(database_url)
+        if len(attempts) < 3:
+            raise db_module.psycopg.OperationalError("connection timeout expired")
+        return fake
+
+    monkeypatch.setattr(db_module.psycopg, "connect", _fake_connect)
+    monkeypatch.setattr(db_module.time, "sleep", lambda seconds: None)
+
+    conn = get_connection(database_url="postgresql://example/db")
+
+    assert conn is fake
+    assert len(attempts) == 3
+
+
+def test_get_connection_raises_after_exhausting_retries(monkeypatch):
+    def _always_fails(database_url):
+        raise db_module.psycopg.OperationalError("connection timeout expired")
+
+    monkeypatch.setattr(db_module.psycopg, "connect", _always_fails)
+    monkeypatch.setattr(db_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(db_module.psycopg.OperationalError):
+        get_connection(database_url="postgresql://example/db")
 
 
 def test_upsert_anomaly_executes_insert_with_correct_params_and_commits():

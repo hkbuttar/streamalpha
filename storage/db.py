@@ -20,10 +20,14 @@ updates the existing row instead of creating a duplicate.
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 
 import psycopg
 from psycopg.types.json import Json
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS anomalies (
@@ -38,12 +42,39 @@ CREATE TABLE IF NOT EXISTS anomalies (
 """
 
 
+CONNECT_RETRIES = 5
+CONNECT_RETRY_DELAY_SECONDS = 3
+
+
 def get_connection(database_url: str | None = None) -> psycopg.Connection:
     """Connect using DATABASE_URL (or the given override) and ensure the
     schema exists.
+
+    Retries on connect failure -- confirmed live on Render: storage/sink.py
+    calls this at process startup, immediately after constructing the Kafka
+    consumer, and consistently hit psycopg.errors.ConnectionTimeout there
+    while the identical DATABASE_URL worked fine moments later from
+    backend/main.py (which only connects lazily, per-request, well after
+    the container has been running a while) -- a container's outbound
+    networking isn't necessarily ready in the first instant its process
+    starts. backend's per-request calls don't hit this window, so they
+    don't need the retry, but it's harmless there too.
     """
     database_url = database_url or os.environ["DATABASE_URL"]
-    conn = psycopg.connect(database_url)
+    for attempt in range(1, CONNECT_RETRIES + 1):
+        try:
+            conn = psycopg.connect(database_url)
+            break
+        except psycopg.OperationalError:
+            if attempt == CONNECT_RETRIES:
+                raise
+            log.warning(
+                "Postgres connection attempt %d/%d failed, retrying in %ds",
+                attempt,
+                CONNECT_RETRIES,
+                CONNECT_RETRY_DELAY_SECONDS,
+            )
+            time.sleep(CONNECT_RETRY_DELAY_SECONDS)
     with conn.cursor() as cur:
         cur.execute(SCHEMA)
     conn.commit()
